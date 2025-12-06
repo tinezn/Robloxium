@@ -1,0 +1,1873 @@
+import customtkinter as ctk
+import tkinter.messagebox as messagebox
+import tkinter.simpledialog as simpledialog
+import json
+import threading
+import subprocess
+import psutil
+import os
+import time
+import random
+import requests
+from discord import Embed
+from datetime import datetime
+from pytz import timezone as get_localzone
+import win32gui
+import win32process
+import win32con
+import win32api
+from mss import mss
+from PIL import Image
+import pytesseract
+import asyncio
+import logging
+import base64
+import queue
+
+try:
+    import discord
+    from discord.ext import commands, tasks
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+    print("[WARNING] discord.py not installed. Discord features disabled.")
+
+from cryptography.fernet import Fernet
+import hashlib
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# === CONFIGURATION ===
+ERROR_SCAN_ENABLED = False
+REPORT_CHANNEL_ID = None
+BOT_TOKEN = None
+ROBLOX_EXE = "RobloxPlayerBeta.exe"
+STATE_KEYWORDS = ["Disconnected", "Error Code", "Reconnect", "Kicked", "Lost Connection", "Banned"]
+
+# Load config if exists
+CONFIG_FILE = "config.json"
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            BOT_TOKEN = config.get("bot_token")
+            REPORT_CHANNEL_ID = config.get("channel_id")
+    except:
+        pass
+
+# === GLOBAL STATE ===
+tracked_accounts = {}  # username: pid
+tracked_hwnds = {}  # username: hwnd
+launched_accounts = set()
+last_errors = {}  # username: (keyword, timestamp)
+error_counter = {}  # username: int
+last_status_message = None
+_discord_connected = False
+_bot_running = False
+
+state_lock = threading.Lock()
+launch_lock = threading.Lock()
+
+class ToolTip:
+    def __init__(self, widget, text, delay=300):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tip = None
+        self.timer = None
+
+        self.widget.bind("<Enter>", self.on_enter)
+        self.widget.bind("<Leave>", self.on_leave)
+        self.widget.bind("<ButtonPress>", self.on_leave)
+
+    def on_enter(self, event=None):
+        self.timer = self.widget.after(self.delay, self.show_tip)
+
+    def on_leave(self, event=None):
+        if self.timer:
+            self.widget.after_cancel(self.timer)
+            self.timer = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+    def show_tip(self):
+        if self.tip or not self.widget.winfo_exists():
+            return
+
+        x = self.widget.winfo_pointerx() + 15
+        y = self.widget.winfo_pointery() + 15
+
+        self.tip = ctk.CTkToplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+        label = ctk.CTkLabel(
+            self.tip,
+            text=self.text,
+            corner_radius=8,
+            fg_color="#1e1e1e",
+            text_color="#ffffff",
+            padx=10,
+            pady=6,
+            font=ctk.CTkFont(size=12)
+        )
+        label.pack()
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+def log(msg):
+    logging.info(msg)
+
+def get_active_count():
+    count = 0
+    for proc in psutil.process_iter(['name']):
+        if proc.info['name'] == "RobloxPlayerBeta.exe":
+            count += 1
+    return count
+
+def get_roblox_pids():
+    return {p.pid for p in psutil.process_iter(['name']) if p.info['name'] == ROBLOX_EXE}
+
+def wait_for_new_pid(prev_pids, timeout=60):
+    start = time.time()
+    while time.time() - start < timeout:
+        new = get_roblox_pids() - prev_pids
+        if new:
+            pid = next(iter(new))
+            if psutil.pid_exists(pid):
+                return pid
+        time.sleep(1)
+    return None
+
+def get_hwnd_from_pid(pid):
+    hwnds = []
+    def enum(h, _):
+        try:
+            _, p = win32process.GetWindowThreadProcessId(h)
+            if p == pid and win32gui.IsWindowVisible(h):
+                hwnds.append(h)
+        except:
+            pass
+    win32gui.EnumWindows(enum, None)
+    return hwnds[0] if hwnds else None
+
+def wait_for_hwnd(pid, timeout=30):
+    start = time.time()
+    while time.time() - start < timeout:
+        hwnd = get_hwnd_from_pid(pid)
+        if hwnd:
+            return hwnd
+        time.sleep(1)
+    return None
+
+class DiscordBot:
+    def __init__(self, app):
+        self.app = app
+        intents = discord.Intents.default()
+        intents.message_content = True
+        self.bot = commands.Bot(command_prefix="!", intents=intents)
+
+        @self.bot.event
+        async def on_ready():
+            logging.info(f"Discord bot connected as {self.bot.user}")
+            self.app.discord_status_label.configure(text="Discord: Active", text_color="#4caf50")
+            global _discord_connected
+            _discord_connected = True
+
+        @self.bot.command()
+        async def ping(ctx):
+            await ctx.send("Pong!")
+
+        @self.bot.command()
+        async def status(ctx):
+            active = get_active_count()
+            await ctx.send(f"Current status: {active} active accounts\nAccounts: {', '.join(self.app.manager.accounts.keys())}")
+
+        @self.bot.command()
+        async def launch(ctx, username: str):
+            if username in self.app.manager.accounts:
+                place_id, job_id = self.app.get_server_info()
+                self.app.manager.launch_roblox(username, place_id, job_id=job_id)
+                await ctx.send(f"Launched {username}")
+            else:
+                await ctx.send(f"Account {username} not found")
+
+        @self.bot.command()
+        async def restart(ctx, username: str):
+            if username in self.app.manager.accounts:
+                if username in tracked_accounts:
+                    try:
+                        psutil.Process(tracked_accounts[username]).kill()
+                    except:
+                        pass
+                    with state_lock:
+                        tracked_accounts.pop(username, None)
+                        tracked_hwnds.pop(username, None)
+                with state_lock:
+                    launched_accounts.discard(username)
+                place_id, job_id = self.app.get_server_info()
+                self.app.manager.launch_roblox(username, place_id, job_id=job_id)
+                await ctx.send(f"Restarted {username}")
+            else:
+                await ctx.send(f"Account {username} not found")
+
+        @self.bot.command()
+        async def launchall(ctx):
+            self.app.launch_all()
+            await ctx.send("Launched all accounts")
+
+        @self.bot.command()
+        async def killall(ctx):
+            self.app.kill_all()
+            await ctx.send("Killed all instances")
+
+        @self.bot.command()
+        async def toggleocr(ctx):
+            self.app.ocr_var.set(not self.app.ocr_var.get())
+            self.app.toggle_ocr()
+            await ctx.send(f"Error Scan {'enabled' if self.app.ocr_var.get() else 'disabled'}")
+
+    async def send_report(self):
+        channel = self.bot.get_channel(REPORT_CHANNEL_ID)
+        if not channel:
+            logging.warning("Report failed: Channel not found or no permission")
+            self.app.report_label.configure(text=" • Report: Failed", text_color="#ffcc00")
+            return
+
+        try:
+            global last_status_message
+            if last_status_message:
+                try:
+                    old = await channel.fetch_message(last_status_message.id)
+                    await old.delete()
+                except discord.errors.Forbidden:
+                    logging.warning("No permission to delete message")
+                except:
+                    pass
+
+            with state_lock:
+                all_accounts = sorted(
+                    launched_accounts |
+                    set(tracked_accounts.keys()) |
+                    set(last_errors.keys())
+                )
+
+                status_lines = []
+                for name in all_accounts:
+                    pid = tracked_accounts.get(name)
+                    hwnd = tracked_hwnds.get(name)
+                    error = last_errors.get(name)
+
+                    if error:
+                        keyword, _ = error
+                        status_lines.append(f"**{name}** - Inactive – {keyword}")
+                    elif pid and hwnd and psutil.pid_exists(pid) and win32gui.IsWindow(hwnd):
+                        status_lines.append(f"**{name}** - Active")
+                    else:
+                        status_lines.append(f"**{name}** - Inactive")
+
+            embed = Embed(
+                title="Account Status Report",
+                description="\n".join(status_lines),
+                color=0x00ff00,
+                timestamp=datetime.now(get_localzone())
+            )
+            embed.set_footer(text="Updated on error detection")
+
+            sent_message = await channel.send(embed=embed)
+            last_status_message = sent_message
+            logging.info("Report sent successfully")
+            self.app.report_label.configure(text=" • Report: ON", text_color="#4caf50")
+
+        except Exception as e:
+            logging.error(f"Report failed: {e}")
+            self.app.report_label.configure(text=" • Report: Failed", text_color="#ffcc00")
+
+class ModernRobloxManager(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Roblox Watcher -by Tinezn")
+        self.geometry("1100x680")
+        self.minsize(980, 600)
+        self.configure(fg_color="#0a0a0a")
+
+        self.manager = RobloxAccountManager(password="default")  # Use a secure password in production
+        self.settings_window = None
+        self.help_window = None
+        self.selected_accounts = set()
+        self.check_vars = {}
+        self.discord_bot = None
+        self.account_widgets = {}  # For optimizing populate_accounts
+        self.gui_queue = queue.Queue()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.build_ui()
+        self.populate_accounts()
+        self.update_active()
+        if BOT_TOKEN and DISCORD_AVAILABLE:
+            self.connect_bot()
+        self.after(100, self.process_gui_queue)
+
+    def process_gui_queue(self):
+        try:
+            while not self.gui_queue.empty():
+                func = self.gui_queue.get()
+                try:
+                    func()
+                except Exception as e:
+                    logging.error(f"GUI queue error: {e}")
+        except Exception as e:
+            logging.error(f"Queue error: {e}")
+        self.after(100, self.process_gui_queue)
+
+    def build_ui(self):
+        # Main container
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main.grid_columnconfigure(0, weight=4)  # Larger weight for accounts
+        main.grid_columnconfigure(1, weight=1)  # Smaller for controls panel
+        main.grid_rowconfigure(1, weight=1)
+
+        # ==================== 1. TOP BAR ====================
+        top_bar = ctk.CTkFrame(main, height=72, fg_color="#111114", corner_radius=16)
+        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        top_bar.grid_propagate(False)
+
+        ctk.CTkLabel(top_bar, text="Roblox Multi-Account Watcher", 
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(side="left", padx=24, pady=20)
+
+        # Right side: Status + Buttons
+        right_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
+        right_frame.pack(side="right", padx=18, pady=20)
+
+        # Settings & Help buttons
+        settings_btn = ctk.CTkButton(
+            right_frame, text="⚙", width=36, height=36, corner_radius=20,
+            fg_color="#2d2d33", hover_color="#3d3d44", font=ctk.CTkFont(size=20),
+            command=self.open_settings
+        )
+        settings_btn.pack(side="right")
+        ToolTip(settings_btn, "Open Settings (Discord Bot Token, etc.)")
+
+        help_btn = ctk.CTkButton(
+            right_frame, text="?", width=36, height=36, corner_radius=18,
+            fg_color="#2d2d33", hover_color="#3d3d44", font=ctk.CTkFont(size=18, weight="bold"),
+            command=self.show_help
+        )
+        help_btn.pack(side="right", padx=(0, 10))
+        ToolTip(help_btn, "Click to view How to Use guide")
+
+        # Status indicators
+        self.status_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        self.status_frame.pack(side="right", padx=(0, 20))
+
+        self.active_label = ctk.CTkLabel(self.status_frame, text="0 active", font=ctk.CTkFont(size=14, weight="bold"), text_color="#888")
+        self.active_label.pack(side="left")
+
+        self.ocr_label = ctk.CTkLabel(self.status_frame, text=" • OCR: OFF", font=ctk.CTkFont(size=14), text_color="#888")
+        self.ocr_label.pack(side="left", padx=(8, 0))
+
+        self.report_label = ctk.CTkLabel(self.status_frame, text=" • Report: OFF", font=ctk.CTkFont(size=14), text_color="#888")
+        self.report_label.pack(side="left", padx=(8, 0))
+
+        self.discord_status_label = ctk.CTkLabel(
+            right_frame, text="Discord: Offline", font=ctk.CTkFont(size=14), text_color="#ff4444"
+        )
+        self.discord_status_label.pack(side="right", padx=(0, 24))
+
+        # ==================== 2. ACCOUNTS PANEL (LEFT, EXPANDABLE) ====================
+        accounts_panel = ctk.CTkFrame(main, fg_color="#111114", corner_radius=16)
+        accounts_panel.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
+        accounts_panel.grid_columnconfigure(0, weight=1)
+        accounts_panel.grid_rowconfigure(1, weight=1)
+
+        # Header
+        header = ctk.CTkFrame(accounts_panel, height=48, fg_color="#19191e", corner_radius=0)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_propagate(False)
+        ctk.CTkLabel(header, text="Accounts", font=ctk.CTkFont(size=17, weight="bold"),
+                     text_color="#cccccc").pack(side="left", padx=20, pady=12)
+
+        # Scrollable accounts list
+        self.accounts_frame = ctk.CTkScrollableFrame(
+            accounts_panel, fg_color="#0c0c0f", corner_radius=14
+        )
+        self.accounts_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=18)
+
+        # ==================== 3. ACCOUNT CONTROLS PANEL (RIGHT) ====================
+        controls_panel = ctk.CTkFrame(main, fg_color="#111114", corner_radius=16)
+        controls_panel.grid(row=1, column=1, sticky="nsew", pady=(0, 12), padx=(12, 0))
+        controls_panel.grid_columnconfigure(0, weight=1)
+
+        # Header
+        controls_header = ctk.CTkFrame(controls_panel, height=48, fg_color="#19191e", corner_radius=0)
+        controls_header.grid(row=0, column=0, sticky="ew")
+        controls_header.grid_propagate(False)
+        ctk.CTkLabel(controls_header, text="Account Controls", font=ctk.CTkFont(size=17, weight="bold"),
+                     text_color="#cccccc").pack(side="left", padx=20, pady=12)
+
+        # Inputs
+        input_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
+        input_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=10)
+
+        ctk.CTkLabel(input_frame, text="Place ID").pack(anchor="w")
+        self.place_entry = ctk.CTkEntry(input_frame)
+        self.place_entry.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(input_frame, text="Job ID (Optional)").pack(anchor="w")
+        self.job_entry = ctk.CTkEntry(input_frame)
+        self.job_entry.pack(fill="x", pady=5)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=18, pady=10)
+
+        def styled_btn(text, cmd, fg="#1a1a1f", hover="#26262e"):
+            b = ctk.CTkButton(
+                btn_frame, text=text, command=cmd, width=148, height=44,
+                corner_radius=12, fg_color=fg, hover_color=hover,
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            b.pack(fill="x", pady=5)
+            return b
+
+        join_btn = styled_btn("Join Server", self.join_server)
+        ToolTip(join_btn, "Join selected accounts to the specified server")
+
+        launch_all_btn = styled_btn("Launch All", self.launch_all)
+        ToolTip(launch_all_btn, "Launch every account")
+
+        kill_all_btn = styled_btn("Kill All", self.kill_all)
+        ToolTip(kill_all_btn, "Close all running Roblox instances")
+
+        # ==================== 4. CONTROLS (BOTTOM, FIXED) ====================
+        bottom_controls = ctk.CTkFrame(main, height=68, fg_color="#131316", corner_radius=14)
+        bottom_controls.grid(row=2, column=0, columnspan=2, sticky="ew")
+        bottom_controls.grid_propagate(False)
+        for i in range(5):
+            bottom_controls.grid_columnconfigure(i, weight=1)
+
+        def btn(text, cmd, col, fg="#1a1a1f", hover="#26262e"):
+            b = ctk.CTkButton(
+                bottom_controls, text=text, command=cmd, width=148, height=44,
+                corner_radius=12, fg_color=fg, hover_color=hover,
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            b.grid(row=0, column=col, padx=9, pady=10)
+            return b
+
+        add_btn = btn("Add Account", self.add_account_btn, 0)
+        ToolTip(add_btn, "Add a new account")
+
+        self.remove_btn = btn("Remove", self.remove_accounts, 1, fg="#2d1122", hover="#551133")
+        ToolTip(self.remove_btn, "Remove selected accounts")
+        self.remove_btn.configure(state="disabled")
+
+        open_browser_btn = btn("Open Browser", self.open_browser, 2)
+        ToolTip(open_browser_btn, "Open browser for account management")
+
+        # Switches on the right
+        self.ocr_var = ctk.BooleanVar(value=ERROR_SCAN_ENABLED)
+        ocr_switch = ctk.CTkSwitch(
+            bottom_controls, text="Error Scan", variable=self.ocr_var,
+            progress_color="#eee3f7", button_color="#333", button_hover_color="#555",
+            font=ctk.CTkFont(size=13), command=self.toggle_ocr
+        )
+        ocr_switch.grid(row=0, column=3, padx=20)
+        ToolTip(ocr_switch, "Enable error detection")
+
+        self.report_var = ctk.BooleanVar(value=False)
+        report_switch = ctk.CTkSwitch(
+            bottom_controls, text="Discord Report", variable=self.report_var,
+            progress_color="#eee3f7", button_color="#333", button_hover_color="#555",
+            font=ctk.CTkFont(size=13), command=self.toggle_report
+        )
+        report_switch.grid(row=0, column=4, padx=20)
+        ToolTip(report_switch, "Automatically send account status report to Discord on error")
+
+    def populate_accounts(self):
+        current_usernames = set(self.manager.accounts.keys())
+
+        # Remove widgets for deleted accounts
+        for username in list(self.account_widgets.keys()):
+            if username not in current_usernames:
+                self.account_widgets[username]['card'].destroy()
+                del self.account_widgets[username]
+
+        self.check_vars = {u: v for u, v in self.check_vars.items() if u in current_usernames}
+        self.selected_accounts = {u for u in self.selected_accounts if u in current_usernames}
+
+        for i, (username, data) in enumerate(sorted(self.manager.accounts.items())):
+            with state_lock:
+                online = username in launched_accounts and username in tracked_accounts and username in tracked_hwnds and psutil.pid_exists(tracked_accounts[username]) and win32gui.IsWindow(tracked_hwnds[username])
+                err = username in last_errors
+
+            if username not in self.account_widgets:
+                card = ctk.CTkFrame(self.accounts_frame, height=62, corner_radius=12,
+                                    fg_color="#141417" if i % 2 == 0 else "#18181c")
+                card.pack(fill="x", pady=4, padx=6)
+                card.grid_columnconfigure(2, weight=1)
+
+                var = ctk.BooleanVar()
+                self.check_vars[username] = var
+                checkbox = ctk.CTkCheckBox(card, text="", variable=var, width=20, fg_color="#9d4edd")
+                checkbox.grid(row=0, column=0, padx=15, pady=15)
+
+                status_dot = ctk.CTkLabel(card, text="●", font=ctk.CTkFont(size=20))
+                status_dot.grid(row=0, column=1, padx=(0, 10))
+
+                name_label = ctk.CTkLabel(card, text=username, font=ctk.CTkFont(size=17, weight="bold"), anchor="w")
+                name_label.grid(row=0, column=2, sticky="w", padx=8)
+
+                status_label = ctk.CTkLabel(card, font=ctk.CTkFont(size=13))
+                status_label.grid(row=0, column=3, padx=20)
+
+                game_label = ctk.CTkLabel(card, text_color="#aaa", font=ctk.CTkFont(size=13))
+                game_label.grid(row=0, column=3, padx=(0, 20), sticky="e")
+
+                restart_btn = ctk.CTkButton(card, text="Restart", width=88, fg_color="#222226", hover_color="#333338")
+                restart_btn.grid(row=0, column=4, padx=5)
+
+                kill_btn = ctk.CTkButton(card, text="Kill", width=66, fg_color="#3d1122", hover_color="#6b1a44")
+                kill_btn.grid(row=0, column=5, padx=5)
+
+                self.account_widgets[username] = {
+                    'card': card,
+                    'checkbox': checkbox,
+                    'status_dot': status_dot,
+                    'name_label': name_label,
+                    'status_label': status_label,
+                    'game_label': game_label,
+                    'restart_btn': restart_btn,
+                    'kill_btn': kill_btn
+                }
+
+                var.trace_add("write", self.update_selection)
+
+            widgets = self.account_widgets[username]
+            color = "#00ff88" if online else ("#ff3b5c" if err else "#666")
+            widgets['status_dot'].configure(text_color=color)
+            status_text = "ONLINE" if online else ("ERROR" if err else "OFFLINE")
+            widgets['status_label'].configure(text=status_text, text_color=color)
+
+            if online:
+                game_name = data.get('current_game_name', '')
+                widgets['game_label'].configure(text=game_name)
+                widgets['restart_btn'].configure(command=lambda n=username: self.run_async(lambda: self.restart_account(n)))
+                widgets['kill_btn'].configure(command=lambda n=username: (self.handle_manual_remove(n), self.after(100, self.refresh_full_status)))
+                widgets['restart_btn'].grid()
+                widgets['kill_btn'].grid()
+            else:
+                widgets['game_label'].configure(text='')
+                widgets['restart_btn'].grid_remove()
+                widgets['kill_btn'].grid_remove()
+
+        self.update_selection()
+
+    def update_selection(self, *args):
+        self.selected_accounts = {u for u, v in self.check_vars.items() if v.get()}
+        self.remove_btn.configure(state="normal" if self.selected_accounts else "disabled")
+
+    def add_account_btn(self):
+        threading.Thread(target=self._add_account_thread).start()
+
+    def _add_account_thread(self):
+        if self.manager.add_account(amount=1):  # Limited to 1 for simplicity, can change
+            self.after(0, self.populate_accounts)
+        else:
+            self.after(0, lambda: messagebox.showerror("Error", "Failed to add account(s). Check console for details."))
+
+    def remove_accounts(self):
+        if not self.selected_accounts:
+            return
+        if messagebox.askyesno("Confirm", "Remove selected accounts?"):
+            for u in list(self.selected_accounts):
+                self.manager.delete_account(u)
+            self.populate_accounts()
+
+    def join_server(self):
+        place_id, job_id = self.get_server_info()
+        if place_id is None:
+            return
+        if not place_id:
+            messagebox.showerror("Error", "Place ID required")
+            return
+        if not self.selected_accounts:
+            messagebox.showerror("Error", "No accounts selected")
+            return
+        threading.Thread(target=self._join_server_thread, args=(place_id, job_id)).start()
+
+    def _join_server_thread(self, place_id, job_id):
+        for username in list(self.selected_accounts):
+            self.manager.launch_roblox(username, place_id, job_id=job_id)
+            time.sleep(2)
+
+    def launch_all(self):
+        place_id, job_id = self.get_server_info()
+        if place_id is None:
+            return
+        if not place_id:
+            messagebox.showerror("Error", "Place ID required")
+            return
+        threading.Thread(target=self._launch_all_thread, args=(place_id, job_id)).start()
+
+    def _launch_all_thread(self, place_id, job_id):
+        for username in list(self.manager.accounts.keys()):
+            self.manager.launch_roblox(username, place_id, job_id=job_id)
+            time.sleep(2)
+
+    def kill_all(self):
+        with state_lock:
+            for pid in list(tracked_accounts.values()):
+                try:
+                    psutil.Process(pid).terminate()
+                except:
+                    pass
+            tracked_accounts.clear()
+            tracked_hwnds.clear()
+            launched_accounts.clear()
+        subprocess.call(["taskkill", "/F", "/IM", "RobloxPlayerBeta.exe"])
+        messagebox.showinfo("Success", "All Roblox instances terminated")
+
+    def open_browser(self):
+        if not self.selected_accounts:
+            messagebox.showerror("Error", "No accounts selected")
+            return
+        for username in self.selected_accounts:
+            self.manager.launch_home(username)
+
+    def toggle_ocr(self):
+        enabled = self.ocr_var.get()
+        self.ocr_label.configure(text=f" • OCR: {'ON' if enabled else 'OFF'}", text_color="#4caf50" if enabled else "#888")
+        if enabled:
+            threading.Thread(target=self.scan_loop, daemon=True).start()
+
+    def scan_loop(self):
+        while self.ocr_var.get():
+            self.check_account_statuses()
+            self.check_accounts_for_errors()
+            self.gui_queue.put(lambda: self.populate_accounts())
+            time.sleep(10)
+
+    def toggle_report(self):
+        enabled = self.report_var.get()
+        self.report_label.configure(text=f" • Report: {'ON' if enabled else 'OFF'}", text_color="#4caf50" if enabled else "#888")
+
+    def update_active(self):
+        active = get_active_count()
+        self.active_label.configure(text=f"{active} active")
+        self.after(10000, self.update_active)  # Increased interval
+
+    def get_server_info(self):
+        place_id = self.place_entry.get().strip()
+        job_input = self.job_entry.get().strip()
+    
+        if not job_input:
+            return place_id, None
+    
+        if job_input.startswith('https://www.roblox.com/share?'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(job_input)
+            query_params = parse_qs(parsed_url.query)
+            code = query_params.get('code', [None])[0]
+            type_param = query_params.get('type', [None])[0]
+        
+            if code and type_param == 'Server':
+                return place_id, code
+            else:
+                messagebox.showerror("Invalid Input", "The provided URL is not a valid Roblox server share link.")
+                return None, None
+        else:
+            return place_id, job_input
+
+    def check_account_statuses(self):
+        to_remove = []
+        with state_lock:
+            for username, pid in list(tracked_accounts.items()):
+                try:
+                    p = psutil.Process(pid)
+                    if p.name() != ROBLOX_EXE or not p.is_running():
+                        to_remove.append(username)
+                except psutil.NoSuchProcess:
+                    to_remove.append(username)
+            for u in to_remove:
+                tracked_accounts.pop(u, None)
+                tracked_hwnds.pop(u, None)
+                launched_accounts.discard(u)
+                ts = datetime.now().strftime("%H:%M:%S")
+                last_errors[u] = ("Process died", ts)
+                error_counter[u] = error_counter.get(u, 0) + 1
+                logging.info(f"PID missing for {u} → setting error")
+                if self.ocr_var.get() and error_counter.get(u, 0) < 4:
+                    delay = 5 * (2 ** error_counter.get(u, 0))  # Exponential backoff
+                    threading.Thread(target=self._relaunch_account, args=(u, delay)).start()
+                if self.report_var.get() and self.discord_bot:
+                    asyncio.run_coroutine_threadsafe(self.discord_bot.send_report(), self.discord_bot.bot.loop)
+
+    def _relaunch_account(self, u, delay):
+        time.sleep(delay)
+        server = self.manager.accounts.get(u, {}).get('current_server', {})
+        place_id = server.get('place_id')
+        job_id = server.get('job_id')
+        if place_id:
+            self.manager.launch_roblox(u, place_id, job_id=job_id)
+
+    def check_accounts_for_errors(self):
+        with state_lock:
+            for name, hwnd in list(tracked_hwnds.items()):
+                if not win32gui.IsWindow(hwnd):
+                    continue
+                try:
+                    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+                    win32gui.SetForegroundWindow(hwnd)
+                    win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.5)
+                    img = self.capture_window(hwnd)
+                    text = pytesseract.image_to_string(img, config='--psm 6 --oem 3')
+                    for kw in STATE_KEYWORDS:
+                        if kw.lower() in text.lower():
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            last_errors[name] = (kw, ts)
+                            error_counter[name] = error_counter.get(name, 0) + 1
+                            pid = tracked_accounts.pop(name, None)
+                            tracked_hwnds.pop(name, None)
+                            if pid:
+                                try:
+                                    psutil.Process(pid).terminate()
+                                except:
+                                    pass
+                            logging.info(f"OCR detected '{kw}' → relaunching {name}")
+                            if self.ocr_var.get() and error_counter.get(name, 0) < 4:
+                                delay = 5 * (2 ** error_counter.get(name, 0))
+                                threading.Thread(target=self._relaunch_account, args=(name, delay)).start()
+                            if self.report_var.get() and self.discord_bot:
+                                asyncio.run_coroutine_threadsafe(self.discord_bot.send_report(), self.discord_bot.bot.loop)
+                            break
+                except Exception as e:
+                    logging.error(f"OCR failed on {name}: {e}")
+
+            for name in list(last_errors.keys()):
+                if name in tracked_accounts:
+                    del last_errors[name]
+
+    def capture_window(self, hwnd):
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        width = right - left
+        height = bottom - top
+        rect = win32gui.GetWindowRect(hwnd)
+        left, top = rect[0] + 8, rect[1] + 31  # Adjust for borders
+        with mss() as sct:
+            monitor = {"top": top, "left": left, "width": width, "height": height}
+            sct_img = sct.grab(monitor)
+            img = Image.frombytes("RGB", sct_img.size, sct_img.rgb)
+        return img
+
+    def run_async(self, func):
+        threading.Thread(target=func, daemon=True).start()
+
+    def restart_account(self, name):
+        self.handle_manual_remove(name)
+        server = self.manager.accounts.get(name, {}).get('current_server', {})
+        place_id = server.get('place_id')
+        job_id = server.get('job_id')
+        if place_id:
+            self.manager.launch_roblox(name, place_id, job_id=job_id)
+
+    def handle_manual_remove(self, name):
+        with state_lock:
+            if name in tracked_accounts:
+                pid = tracked_accounts[name]
+                try:
+                    psutil.Process(pid).terminate()
+                except:
+                    pass
+                tracked_accounts.pop(name, None)
+            tracked_hwnds.pop(name, None)
+            launched_accounts.discard(name)
+
+    def refresh_full_status(self):
+        self.check_account_statuses()
+        self.populate_accounts()
+
+    def open_settings(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        settings_win = ctk.CTkToplevel(self)
+        self.settings_window = settings_win
+
+        settings_win.title("Settings")
+        settings_win.geometry("480x460")
+        settings_win.resizable(False, False)
+        settings_win.configure(fg_color="#0a0a0a")
+        settings_win.attributes("-alpha", 0.98)
+        settings_win.attributes("-topmost", False)
+        settings_win.transient(self)
+
+        settings_win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (settings_win.winfo_width() // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (settings_win.winfo_height() // 2)
+        settings_win.geometry(f"+{x}+{y}")
+
+        def on_close():
+            self.settings_window = None
+            settings_win.destroy()
+
+        settings_win.protocol("WM_DELETE_WINDOW", on_close)
+        settings_win.bind("<Escape>", lambda e: on_close())
+
+        ctk.CTkLabel(settings_win, text="Settings", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(28, 20))
+
+        # === Discord Bot Token ===
+        token_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
+        token_frame.pack(padx=40, pady=(0, 12), fill="x")
+
+        ctk.CTkLabel(token_frame, text="Discord Bot Token", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
+        self.token_entry = ctk.CTkEntry(token_frame, placeholder_text="Paste token here...", show="•", height=40, corner_radius=10)
+        self.token_entry.insert(0, BOT_TOKEN or "")
+        self.token_entry.pack(padx=24, pady=(0, 16), fill="x")
+
+        # === Report Channel ID ===
+        channel_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
+        channel_frame.pack(padx=40, pady=(0, 20), fill="x")
+
+        ctk.CTkLabel(channel_frame, text="Report Channel ID", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
+        self.channel_entry = ctk.CTkEntry(channel_frame, placeholder_text="Right-click channel → Copy Channel ID", height=40, corner_radius=10)
+        self.channel_entry.insert(0, str(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else "")
+        self.channel_entry.pack(padx=24, pady=(0, 16), fill="x")
+
+        # Status label
+        self.settings_status = ctk.CTkLabel(settings_win, text="", font=ctk.CTkFont(size=13), height=32)
+        self.settings_status.pack(pady=10)
+
+        # Buttons frame
+        btn_frame = ctk.CTkFrame(settings_win, fg_color="transparent")
+        btn_frame.pack(pady=16)
+
+        ctk.CTkButton(
+            btn_frame, text="Save Settings", width=150, height=44,
+            font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b2b2b", hover_color="#3d3d3d",
+            command=self.save_settings
+        ).grid(row=0, column=0, padx=14)
+
+        ctk.CTkButton(
+            btn_frame, text="Connect Bot", width=150, height=44,
+            font=ctk.CTkFont(size=14, weight="bold"), fg_color="#1a6333", hover_color="#2d8a4d",
+            text_color="#ffffff", command=self.connect_bot
+        ).grid(row=0, column=1, padx=14)
+
+        ctk.CTkButton(
+            settings_win, text="Close", width=320, height=44,
+            font=ctk.CTkFont(size=14, weight="bold"), fg_color="#333338", hover_color="#44444a",
+            command=on_close
+        ).pack(pady=(10, 28))
+
+    def save_settings(self):
+        global BOT_TOKEN, REPORT_CHANNEL_ID
+        BOT_TOKEN = self.token_entry.get().strip() or None
+        try:
+            REPORT_CHANNEL_ID = int(self.channel_entry.get().strip()) if self.channel_entry.get().strip() else None
+        except ValueError:
+            self.settings_status.configure(text="Invalid Channel ID (must be a number)!", text_color="#ff4444")
+            return
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"bot_token": BOT_TOKEN, "channel_id": REPORT_CHANNEL_ID}, f)
+        self.settings_status.configure(text="Settings saved!", text_color="#4caf50")
+        if not REPORT_CHANNEL_ID:
+            self.report_var.set(False)
+            self.toggle_report()
+
+    def connect_bot(self):
+        if not DISCORD_AVAILABLE:
+            messagebox.showerror("Error", "discord.py not installed")
+            return
+        if not BOT_TOKEN:
+            messagebox.showerror("Error", "Bot token required")
+            return
+        if self.discord_bot:
+            return
+        self.discord_bot = DiscordBot(self)
+        threading.Thread(target=self.discord_bot.bot.run, args=(BOT_TOKEN,), daemon=True).start()
+
+    def show_help(self):
+        help_text = """
+Roblox Multi-Account Watcher – Complete Guide (2025)
+
+1. First-Time Discord Bot Setup
+   • Go to: https://discord.com/developers/applications
+   • Create New Application → name it (e.g. "Roblox Watcher")
+   • Bot tab → Add Bot → Copy Token
+   • Enable these intents & permissions:
+        ○ Send Messages
+        ○ Embed Links
+        ○ Attach Files
+        ○ Read Message History
+   • OAuth2 → URL Generator → select "bot" → add above permissions
+   • Use generated link to invite bot to your server
+
+2. Connect Bot in App
+   • Click Settings (gear icon)
+   • Paste your bot token → Save Settings
+   • Enter your Report Channel ID (right-click channel → Copy Channel ID)
+   • Click Save Settings → then Connect Bot
+   • Success = Discord: Active (top-right)
+
+3. Using the App
+   • Open Roblox Account Manager (RAM) first — REQUIRED
+   • All accounts from RAM appear automatically
+
+4 Main Buttons
+   • Launch All     → Starts all accounts + kills rogue Roblox processes
+   • Kill All       → Force closes every Roblox instance
+
+5 Switches
+   • Error Scan     Auto-detects disconnects/kicks → instantly relaunches
+   • Discord Report Sends full status report every 5 minutes
+
+6 Status Bar (Top Right)
+   • # active        Number of currently running accounts
+   • OCR: ON/OFF     Error scanning status
+   • Report: ON      Bright green = last report sent successfully
+             Failed  Yellow = report failed (wrong/no channel, bot offline)
+             OFF     Gray = disabled
+
+7 Settings Window Behavior
+   • Clearing Channel ID → Discord Report auto-turns OFF
+   • Settings & Help windows always open on top of main app
+   • No longer stuck behind main window
+
+8 Discord Bot Commands (type in any channel bot can see)
+   !ping            → Pong!
+   !status          → Instant full report
+   !launch <name>   → Launch specific account
+   !restart <name>  → Kill + relaunch
+   !launchall       → Launch all accounts
+   !killall         → Kill all instances
+   !toggleocr       → Toggle error scanning on/off
+
+   Examples:
+      !launch john123
+      !restart alice_alt
+
+Pro Tips
+   • Keep RAM open in background — accounts won’t appear otherwise
+   • Report stays bright green only when messages are actually sent
+   • Yellow "Report: Failed" = check Channel ID or bot connection
+   • App auto-cleans rogue Roblox processes on Launch All
+
+You're all set — enjoy flawless multi-account farming!
+        """.strip()
+        if self.help_window and self.help_window.winfo_exists():
+            self.help_window.lift()
+            self.help_window.focus_force()
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        self.help_window = dialog
+        dialog.title("How to Use – Roblox Multi-Account Watcher")
+        dialog.geometry("760x680")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color="#0f0f0f")
+        dialog.attributes("-topmost", False)
+        dialog.transient(self)
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (760 // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (680 // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        def on_close():
+            self.help_window = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        dialog.bind("<Escape>", lambda e: on_close())
+
+        ctk.CTkLabel(
+            dialog,
+            text="How to Use – Roblox Multi-Account Watcher",
+            font=ctk.CTkFont(size=19, weight="bold"),
+            text_color="#e0e0e0"
+        ).pack(pady=(24, 12))
+
+        text_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        text_frame.pack(padx=30, pady=(0, 20), fill="both", expand=True)
+
+        text_box = ctk.CTkTextbox(
+            text_frame,
+            font=ctk.CTkFont(family="Consolas", size=13),
+            wrap="word",
+            fg_color="#1a1a1a",
+            text_color="#e0e0e0",
+            corner_radius=12
+        )
+        text_box.pack(fill="both", expand=True)
+
+        text_box.insert("0.0", help_text)
+        text_box.configure(state="disabled")
+
+
+"""
+Roblox API interaction utilities
+Handles authentication, info, and game launching
+"""
+
+import os
+import time
+import random
+import requests
+
+
+
+class RobloxAPI:
+    """Handles all Roblox API interactions"""
+    
+    @staticmethod
+    def get_username_from_api(roblosecurity_cookie):
+        """Get username using Roblox API"""
+        try:
+            headers = {
+                'Cookie': f'.ROBLOSECURITY={roblosecurity_cookie}'
+            }
+            
+            response = requests.get(
+                'https://users.roblox.com/v1/users/authenticated',
+                headers=headers,
+                timeout=3
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                return user_data.get('name', 'Unknown')
+            
+        except Exception as e:
+            logging.error(f"Error getting username from API: {e}")
+        
+        return "Unknown"
+    
+    @staticmethod
+    def get_auth_ticket(roblosecurity_cookie):
+        """Get authentication ticket for launching Roblox games"""
+        url = "https://auth.roblox.com/v1/authentication-ticket/"
+        headers = {
+            "User-Agent": "Roblox/WinInet",
+            "Referer": "https://www.roblox.com/develop",
+            "RBX-For-Gameauth": "true",
+            "Content-Type": "application/json",
+            "Cookie": f".ROBLOSECURITY={roblosecurity_cookie}"
+        }
+
+        try:
+            response = requests.post(url, headers=headers, timeout=5)
+            if response.status_code == 403 and "x-csrf-token" in response.headers:
+                csrf_token = response.headers["x-csrf-token"]
+            else:
+                logging.error(f"Failed to get CSRF token, status: {response.status_code}")
+                return None
+
+            headers["X-CSRF-TOKEN"] = csrf_token
+            response2 = requests.post(url, headers=headers, timeout=5)
+            if response2.status_code == 200:
+                auth_ticket = response2.headers.get("rbx-authentication-ticket")
+                if auth_ticket:
+                    return auth_ticket
+                else:
+                    logging.error("Authentication ticket header missing in response.")
+                    return None
+            else:
+                logging.error(f"Failed to get auth ticket, status: {response2.status_code}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            return None
+    
+    @staticmethod
+    def launch_roblox(username, cookie, game_id, job_id=""):
+        """Launch Roblox game with specified account"""
+        logging.info(f"Getting authentication ticket for {username}...")
+        auth_ticket = RobloxAPI.get_auth_ticket(cookie)
+        
+        if not auth_ticket:
+            logging.error("[ERROR] Failed to get authentication ticket")
+            return False
+        
+        logging.info("[SUCCESS] Got authentication ticket!")
+        
+        browser_tracker_id = random.randint(55393295400, 55393295500)
+        launch_time = int(time.time() * 1000)
+        
+        if not game_id or game_id == "":
+            url = (
+                "roblox-player:1+launchmode:play+gameinfo:" + auth_ticket +
+                "+launchtime:" + str(launch_time) +
+                "+browsertrackerid:" + str(browser_tracker_id) +
+                "+robloxLocale:en_us+gameLocale:en_us"
+            )
+            logging.info(f"Launching Roblox Home...")
+            logging.info(f"Account: {username}")
+            try:
+                os.system(f'start "" "{url}"')
+                logging.info("[SUCCESS] Roblox home launched successfully!")
+                return True
+            except Exception as e:
+                logging.error(f"[ERROR] Failed to launch Roblox: {e}")
+                return False
+
+        if job_id:
+            request_type = "RequestGame"
+            extra_params = f"&linkCode={job_id}"
+        else:
+            request_type = "RequestGame"
+            extra_params = ""
+
+        url = (
+            "roblox-player:1+launchmode:play+gameinfo:" + auth_ticket +
+            "+launchtime:" + str(launch_time) +
+            "+placelauncherurl:https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=" + request_type +
+            "&browserTrackerId=" + str(browser_tracker_id) +
+            "&placeId=" + str(game_id) +
+            extra_params +
+            "&isPlayTogetherGame=false" +
+            "+browsertrackerid:" + str(browser_tracker_id) +
+            "+robloxLocale:en_us+gameLocale:en_us"
+        )
+
+        logging.info(f"Launching Roblox...")
+        logging.info(f"Account: {username}")
+        logging.info(f"Game ID: {game_id}")
+        if job_id:
+            logging.info(f"Job ID: {job_id}")
+
+        try:
+            os.system(f'start "" "{url}"')
+            logging.info("[SUCCESS] Roblox launched successfully!")
+            return True
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to launch Roblox: {e}")
+            return False
+    
+    @staticmethod
+    def validate_account(username, cookie):
+        """Validate if an account's cookie is still valid and show detailed token info"""
+        try:
+            headers = {
+                'Cookie': f'.ROBLOSECURITY={cookie}'
+            }
+            
+            response = requests.get(
+                'https://users.roblox.com/v1/users/authenticated',
+                headers=headers,
+                timeout=3
+            )
+            
+            is_valid = response.status_code == 200
+            
+            logging.info(f"\n{'='*60}")
+            logging.info(f"ACCOUNT VALIDATION: {username}")
+            logging.info(f"{'='*60}")
+            logging.info(f"Valid: {'Yes' if is_valid else 'No'}")
+            
+            if cookie:
+                if len(cookie) > 60:
+                    token_preview = f"{cookie[:50]}...{cookie[-10:]}"
+                else:
+                    token_preview = cookie
+                logging.info(f"Token: {token_preview}")
+                logging.info(f"Token Length: {len(cookie)} characters")
+            else:
+                logging.info("Token: (No token found)")
+            
+            if is_valid and response.status_code == 200:
+                try:
+                    user_data = response.json()
+                    logging.info(f"User ID: {user_data.get('id', 'Unknown')}")
+                    logging.info(f"Display Name: {user_data.get('displayName', 'Unknown')}")
+                    logging.info(f"Username: {user_data.get('name', 'Unknown')}")
+                except:
+                    logging.info("Additional info: Could not retrieve user details")
+            else:
+                logging.info(f"Status Code: {response.status_code}")
+                if response.status_code == 401:
+                    logging.info("Reason: Token expired or invalid")
+                elif response.status_code == 403:
+                    logging.info("Reason: Access forbidden")
+                else:
+                    logging.info("Reason: Unknown error")
+            
+            logging.info(f"{'='*60}")
+            return is_valid
+            
+        except Exception as e:
+            logging.info(f"\n{'='*60}")
+            logging.info(f"ACCOUNT VALIDATION: {username}")
+            logging.info(f"{'='*60}")
+            logging.info(f"Valid: No")
+            if cookie:
+                if len(cookie) > 60:
+                    token_preview = f"{cookie[:50]}...{cookie[-10:]}"
+                else:
+                    token_preview = cookie
+                logging.info(f"Token: {token_preview}")
+            logging.info(f"Error: {str(e)}")
+            logging.info(f"{'='*60}")
+            return False
+
+"""
+Account Manager class
+Handles account storage, browser automation, and account management
+"""
+
+import os
+import sys
+import json
+import time
+import tempfile
+import hashlib
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import WebDriverException
+
+
+class RobloxAccountManager:
+    
+    def __init__(self, password=None):
+        self.data_folder = "AccountManagerData"
+        if not os.path.exists(self.data_folder):
+            os.makedirs(self.data_folder)
+        
+        self.accounts_file = os.path.join(self.data_folder, "saved_accounts.json")
+        self.key_file = os.path.join(self.data_folder, "encryption_key.key")
+        
+        if password:
+            digest = hashlib.sha256(password.encode()).digest()
+            encoded_key = base64.urlsafe_b64encode(digest)
+            self.key = Fernet(encoded_key)
+        else:
+            if os.path.exists(self.key_file):
+                with open(self.key_file, 'rb') as f:
+                    self.key = Fernet(f.read())
+            else:
+                key = Fernet.generate_key()
+                with open(self.key_file, 'wb') as f:
+                    f.write(key)
+                self.key = Fernet(key)
+        
+        self.accounts = self.load_accounts()
+        self.temp_profile_dir = None
+        
+    def load_accounts(self):
+        """Load saved accounts from JSON file"""
+        if os.path.exists(self.accounts_file):
+            try:
+                with open(self.accounts_file, 'r', encoding='utf-8') as f:
+                    encrypted_data = json.load(f)
+                accounts = {}
+                for username, data in encrypted_data.items():
+                    data['cookie'] = self._decrypt(data['cookie'])
+                    accounts[username] = data
+                return accounts
+            except Exception as e:
+                logging.error(f"[WARNING] Error loading accounts: {e}")
+                return {}
+        return {}
+    
+    def save_accounts(self):
+        """Save accounts to JSON file"""
+        encrypted_data = {}
+        for username, data in self.accounts.items():
+            enc_data = data.copy()
+            enc_data['cookie'] = self._encrypt(data['cookie'])
+            encrypted_data[username] = enc_data
+        with open(self.accounts_file, 'w', encoding='utf-8') as f:
+            json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
+    
+    def _encrypt(self, text):
+        return self.key.encrypt(text.encode()).decode()
+    
+    def _decrypt(self, enc):
+        return self.key.decrypt(enc.encode()).decode()
+    
+    def create_temp_profile(self):
+        """Create a temporary Chrome profile directory"""
+        self.temp_profile_dir = tempfile.mkdtemp(prefix="roblox_login_")
+        return self.temp_profile_dir
+    
+    def cleanup_temp_profile(self):
+        """Clean up temporary profile directory"""
+        if self.temp_profile_dir and os.path.exists(self.temp_profile_dir):
+            try:
+                import shutil
+                shutil.rmtree(self.temp_profile_dir)
+            except:
+                pass
+    
+    def setup_chrome_driver(self):
+        """Setup Chrome driver with maximum speed optimizations"""
+        profile_dir = self.create_temp_profile()
+    
+        chrome_options = Options()
+        chrome_options.add_argument(f"--user-data-dir={profile_dir}")
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-default-browser-check")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+        chrome_options.add_argument("--log-level=3")
+        chrome_options.add_argument("--silent")
+        chrome_options.add_argument("--disable-logging")
+        chrome_options.add_argument("--disable-gpu-logging")
+        chrome_options.add_argument("--disable-dev-tools")
+        chrome_options.add_argument("--no-default-browser-check")
+        chrome_options.add_argument("--disable-default-apps")
+        chrome_options.add_argument("--disable-web-security")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-plugins")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-component-extensions-with-background-pages")
+        chrome_options.add_argument("--disable-ipc-flooding-protection")
+        chrome_options.add_argument("--disable-hang-monitor")
+        chrome_options.add_argument("--disable-prompt-on-repost")
+        chrome_options.add_argument("--disable-domain-reliability")
+        chrome_options.add_argument("--disable-component-update")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--aggressive-cache-discard")
+    
+        try:
+            service = Service()  # Use built-in Selenium Manager
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            return driver
+        except WebDriverException as e:
+            logging.error(f"Error setting up Chrome driver: {e}")
+            messagebox.showerror("Browser Error", "Could not launch browser. Ensure Google Chrome is installed and up to date. If issues persist, install chromedriver manually.")
+            return None
+        except Exception as e:
+            logging.error(f"Error setting up Chrome driver: {e}")
+            logging.info("Please make sure Google Chrome is installed on your system and up to date.")
+            logging.info("Also, ensure Selenium is updated: pip install -U selenium")
+            return None
+    
+    def wait_for_login(self, driver, timeout=300):
+        """
+        Ultra-fast login detection using ONLY URL method
+        """
+        logging.info("Please log into your Roblox account")
+    
+        detector_script = """
+        window.ultraFastDetection = {
+            detected: false,
+            method: null,
+            debug: [],
+            cleanup: function() {
+                if (this.interval) clearInterval(this.interval);
+                if (this.observer) this.observer.disconnect();
+            }
+        };
+    
+        function instantDetect() {
+            const now = Date.now();
+            window.ultraFastDetection.debug.push('URL Check at: ' + now);
+        
+            const url = window.location.href.toLowerCase();
+            window.ultraFastDetection.debug.push('Current URL: ' + url);
+        
+            if (url.includes('/login') || url.includes('/signup') || url.includes('/createaccount')) {
+                window.ultraFastDetection.debug.push('Still on login/signup/create page - not logged in');
+                return false;
+            }
+        
+            if (url.includes('/home') || url.includes('/games') || 
+                url.includes('/catalog') || url.includes('/avatar') ||
+                url.includes('/discover') || url.includes('/friends') ||
+                url.includes('/profile') || url.includes('/groups') ||
+                url.includes('/develop') || url.includes('/create') ||
+                url.includes('/transactions') || url.includes('/my/avatar') ||
+                url.includes('/users/profile') || url.includes('roblox.com/users/') && !url.includes('/login')) {
+            
+                // Add cookie check after URL match
+                if (document.cookie.includes('.ROBLOSECURITY')) {
+                    window.ultraFastDetection.detected = true;
+                    window.ultraFastDetection.method = 'url_with_cookie';
+                    window.ultraFastDetection.debug.push('✅ DETECTED via URL and cookie! Page: ' + url');
+                    window.ultraFastDetection.cleanup();
+                    return true;
+                } else {
+                    window.ultraFastDetection.debug.push('URL matched but no cookie yet - waiting...');
+                    return false;
+                }
+            }
+        
+            window.ultraFastDetection.debug.push('Not detected - still checking...');
+            return false;
+        }
+    
+        instantDetect();
+    
+        window.ultraFastDetection.interval = setInterval(() => {
+            if (instantDetect()) {
+                clearInterval(window.ultraFastDetection.interval);
+            }
+        }, 25);
+    
+        let lastHref = location.href;
+        window.ultraFastDetection.observer = new MutationObserver(() => {
+            if (location.href !== lastHref) {
+                lastHref = location.href;
+                window.ultraFastDetection.debug.push('URL changed to: ' + location.href);
+                if (instantDetect()) {
+                    clearInterval(window.ultraFastDetection.interval);
+                    window.ultraFastDetection.observer.disconnect();
+                }
+            }
+        });
+        window.ultraFastDetection.observer.observe(document, {subtree: true, childList: true});
+    
+        ['beforeunload', 'unload', 'pagehide'].forEach(event => {
+            window.addEventListener(event, () => {
+                window.ultraFastDetection.cleanup();
+            });
+        });
+        """
+    
+        try:
+            driver.execute_script(detector_script)
+            logging.info("[SUCCESS] Detection script injected successfully")
+        except Exception as e:
+            logging.warning(f"[WARNING] Warning: Could not inject detection script: {e}")
+    
+        start_time = time.time()
+        last_debug_time = 0
+    
+        while time.time() - start_time < timeout:
+            try:
+                result = driver.execute_script("return window.ultraFastDetection;")
+            
+                if result and result.get('detected'):
+                    method = result.get('method', 'url_only')
+                    logging.info(f"[SUCCESS] LOGIN DETECTED! Method: {method} - Closing browser instantly...")
+                    try:
+                        driver.execute_script("window.ultraFastDetection.cleanup();")
+                    except:
+                        pass
+                    return True
+            
+                current_time = time.time()
+                if current_time - last_debug_time > 5:
+                    last_debug_time = current_time
+                    current_url = driver.current_url
+                    logging.info(f"Still checking... Current URL: {current_url}")
+                    if result and result.get('debug'):
+                        recent_debug = result.get('debug', [])[-3:]
+                        for debug_msg in recent_debug:
+                            logging.info(f"Debug: {debug_msg}")
+                    if ('/home' in current_url or '/games' in current_url or 
+                        '/catalog' in current_url or '/avatar' in current_url or
+                        '/discover' in current_url or '/friends' in current_url or
+                        '/profile' in current_url or '/groups' in current_url or
+                        '/develop' in current_url or '/create' in current_url or
+                        '/users/profile' in current_url) and '/login' not in current_url and '/createaccount' not in current_url.lower():
+                        logging.info("[SUCCESS] LOGIN DETECTED via manual URL check!")
+                        return True
+                
+                time.sleep(0.025)
+            
+            except WebDriverException:
+                try:
+                    driver.execute_script("if(window.ultraFastDetection) window.ultraFastDetection.cleanup();")
+                except:
+                    pass
+                return False
+    
+        logging.warning("[WARNING] Login timeout. Please try again.")
+        try:
+            driver.execute_script("if(window.ultraFastDetection) window.ultraFastDetection.cleanup();")
+        except:
+            pass
+        return False
+    
+    def extract_user_info(self, driver):
+        """Extract username and cookie with ultra-fast detection"""
+        try:
+            roblosecurity_cookie = None
+            for attempt in range(3):  # Retry up to 3 times
+                time.sleep(1)  # Short delay for cookie to settle
+                try:
+                    cookies = driver.get_cookies()
+                    roblosecurity_cookie = next((c['value'] for c in cookies if c['name'] == '.ROBLOSECURITY'), None)
+                    if roblosecurity_cookie:
+                        break
+                except:
+                    pass
+            if not roblosecurity_cookie:
+                logging.error("[ERROR] Cookie not found after retries")
+                return None, None
+        
+            username = None
+            try:
+                result = driver.execute_script("return window.ultraFastDetection;")
+                if result and result.get('username'):
+                    username = result.get('username')
+                    logging.info(f"[SUCCESS] Username detected from page: {username}")
+            except:
+                pass
+        
+            if not username:
+                try:
+                    username_selectors = [
+                        "[data-testid='navigation-user-display-name']",
+                        "[data-testid='user-menu-button']",
+                        ".font-header-2.text-color-secondary-alt",
+                        "#nav-username",
+                        ".navigation-user-name"
+                    ]
+                
+                    for selector in username_selectors:
+                        try:
+                            element = driver.find_element(By.CSS_SELECTOR, selector)
+                            if element and element.text.strip():
+                                username = element.text.strip()
+                                break
+                        except:
+                            continue
+                        
+                except Exception:
+                    pass
+        
+            if not username:
+                username = RobloxAPI.get_username_from_api(roblosecurity_cookie)
+        
+            if not username:
+                username = "Unknown"
+        
+            return username, roblosecurity_cookie
+        
+        except Exception as e:
+            logging.error(f"Error extracting user info: {e}")
+            return None, None
+    
+    def add_account(self, amount=1, website="https://www.roblox.com/login", javascript=""):
+        """
+        Add accounts through browser login with optional Javascript execution
+        amount: number of browser instances to open (max 5)
+        website: URL to navigate to
+        javascript: Javascript code to execute after page load
+        """
+        amount = min(amount, 5)  # Limit to 5
+        
+        success_count = 0
+        drivers = []
+    
+        try:
+            logging.info(f"Launching {amount} browser instance(s)...")
+        
+            for i in range(amount):
+                driver = self.setup_chrome_driver()
+                if not driver:
+                    logging.error(f"[ERROR] Failed to setup Chrome driver for instance {i + 1}")
+                    continue
+            
+                window_width = 500
+                window_height = 600
+            
+                screen_width = driver.execute_script("return screen.width;")
+                screen_height = driver.execute_script("return screen.height;")
+            
+                grid_cols = min(3, amount)
+                grid_rows = (amount + grid_cols - 1) // grid_cols
+            
+                col = i % grid_cols
+                row = i // grid_cols
+            
+                x = col * (screen_width // grid_cols) + 10
+                y = row * ((screen_height - 100) // grid_rows) + 10
+            
+                driver.set_window_position(x, y)
+                driver.set_window_size(window_width, window_height)
+            
+                drivers.append(driver)
+            
+                try:
+                    logging.info(f"Opening {website} (instance {i + 1}/{amount})...")
+                    driver.get(website)
+                
+                    if javascript:
+                        logging.info(f"Executing Javascript for instance {i + 1}...")
+                        try:
+                            driver.execute_script(javascript)
+                            logging.info(f"[SUCCESS] Javascript executed for instance {i + 1}")
+                        except Exception as js_error:
+                            logging.warning(f"[WARNING] Javascript execution failed for instance {i + 1}: {js_error}")
+                
+                except Exception as e:
+                    logging.error(f"[ERROR] Error opening browser for instance {i + 1}: {e}")
+        
+            logging.info(f"All {len(drivers)} browser(s) opened. Waiting for logins...")
+        
+            completed = [False] * len(drivers)
+        
+            import threading
+        
+            def wait_for_instance(driver_index):
+                driver = drivers[driver_index]
+                try:
+                    if self.wait_for_login(driver):
+                        username, cookie = self.extract_user_info(driver)
+                    
+                        if username and cookie:
+                            self.accounts[username] = {
+                                'username': username,
+                                'cookie': cookie,
+                                'added_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                            self.save_accounts()
+                        
+                            # Post-add validation
+                            if self.validate_account(username):
+                                logging.info(f"[SUCCESS] Successfully added and validated account: {username}")
+                                nonlocal success_count
+                                success_count += 1
+                            else:
+                                del self.accounts[username]
+                                self.save_accounts()
+                                logging.error(f"[ERROR] Account {username} failed validation - removed")
+                        else:
+                            logging.error(f"[ERROR] Failed to extract account information for instance {driver_index + 1}")
+                            messagebox.showwarning("Cookie Error", "Logged in but couldn't fetch cookie. Try again or check network.")
+                    else:
+                        logging.warning(f"[WARNING] Login timeout for instance {driver_index + 1}")
+                except Exception as e:
+                    logging.error(f"[ERROR] Error waiting for login on instance {driver_index + 1}: {e}")
+                finally:
+                    completed[driver_index] = True
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+        
+            threads = []
+            for i in range(len(drivers)):
+                thread = threading.Thread(target=wait_for_instance, args=(i,))
+                thread.start()
+                threads.append(thread)
+        
+            for thread in threads:
+                thread.join()
+        
+            for driver in drivers:
+                self.cleanup_temp_profile()
+        
+            return success_count > 0
+            
+        except Exception as e:
+            logging.error(f"[ERROR] Error during account addition: {e}")
+            for driver in drivers:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            return False
+        finally:
+            self.cleanup_temp_profile()
+    
+    def import_cookie_account(self, cookie):
+        if not cookie:
+            logging.error("[ERROR] Cookie is required")
+            return False, None
+        
+        cookie = cookie.strip()
+        
+        if not cookie.startswith('_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|'):
+            logging.error("[ERROR] Invalid cookie format")
+            return False, None
+        
+        try:
+            username = RobloxAPI.get_username_from_api(cookie)
+            if not username or username == "Unknown":
+                logging.error("[ERROR] Failed to get username from cookie")
+                return False, None
+            
+            is_valid = RobloxAPI.validate_account(username, cookie)
+            if not is_valid:
+                logging.error("[ERROR] Cookie is invalid or expired")
+                return False, None
+            
+            self.accounts[username] = {
+                'username': username,
+                'cookie': cookie,
+                'added_date': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            self.save_accounts()
+            
+            logging.info(f"[SUCCESS] Successfully imported account: {username}")
+            return True, username
+            
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to import account: {e}")
+            return False, None
+    
+    def delete_account(self, username):
+        """Delete a saved account"""
+        if username in self.accounts:
+            del self.accounts[username]
+            self.save_accounts()
+            logging.info(f"[SUCCESS] Deleted account: {username}")
+            return True
+        else:
+            logging.error(f"[ERROR] Account '{username}' not found")
+            return False
+    
+    def get_account_cookie(self, username):
+        """Get cookie for a specific account"""
+        if username in self.accounts:
+            return self.accounts[username]['cookie']
+        return None
+    
+    def validate_account(self, username):
+        """Validate if an account's cookie is still valid"""
+        cookie = self.get_account_cookie(username)
+        if not cookie:
+            logging.error(f"[ERROR] Account '{username}' not found")
+            return False
+        
+        is_valid = RobloxAPI.validate_account(username, cookie)
+        if not is_valid:
+            self.delete_account(username)
+        return is_valid
+    
+    def launch_home(self, username):
+        """Launch Chrome to Roblox home with account logged in"""
+        if username not in self.accounts:
+            logging.error(f"[ERROR] Account '{username}' not found")
+            return False
+        
+        cookie = self.accounts[username]['cookie']
+        
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.service import Service
+            from selenium.webdriver.chrome.options import Options
+            
+            logging.info(f"Launching Chrome for {username}...")
+            
+            chrome_options = Options()
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            chrome_options.add_argument("--log-level=3")
+            chrome_options.add_argument("--silent")
+            chrome_options.add_argument("--disable-logging")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-usb")
+            chrome_options.add_argument("--disable-device-discovery-notifications")
+            
+            service = Service()  # Use built-in Selenium Manager
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            driver.get("https://www.roblox.com/")
+            
+            driver.add_cookie({
+                'name': '.ROBLOSECURITY',
+                'value': cookie,
+                'domain': '.roblox.com',
+                'path': '/',
+                'secure': True,
+                'httpOnly': True
+            })
+            
+            driver.get("https://www.roblox.com/home")
+            
+            driver.execute_cdp_cmd('Page.setWebLifecycleState', {'state': 'active'})
+            
+            logging.info(f"[SUCCESS] Chrome launched with {username} logged in!")
+            return True
+            
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to launch Chrome: {e}")
+            try:
+                if 'driver' in locals():
+                    driver.quit()
+            except:
+                pass
+            return False
+    
+    def launch_roblox(self, username, game_id, job_id=""):
+        """Launch Roblox game with specified account"""
+        if username not in self.accounts:
+            logging.error(f"[ERROR] Account '{username}' not found")
+            return False
+    
+        cookie = self.accounts[username]['cookie']
+
+        with state_lock:
+            # Kill existing if running
+            if username in tracked_accounts:
+                try:
+                    psutil.Process(tracked_accounts[username]).kill()
+                except:
+                    pass
+                tracked_accounts.pop(username, None)
+                tracked_hwnds.pop(username, None)
+            launched_accounts.discard(username)
+
+        with launch_lock:
+            prev_pids = get_roblox_pids()
+            success = RobloxAPI.launch_roblox(username, cookie, game_id, job_id=job_id)
+            if success:
+                with state_lock:
+                    self.accounts[username]['current_server'] = {'place_id': game_id, 'job_id': job_id}
+                    try:
+                        response = requests.get(f"https://games.roblox.com/v1/games/multiget-place-details?placeIds={game_id}")
+                        if response.status_code == 200:
+                            data = response.json()
+                            if data and 'name' in data[0]:
+                                self.accounts[username]['current_game_name'] = data[0]['name']
+                    except Exception as e:
+                        logging.error(f"Failed to fetch game name: {e}")
+                    self.save_accounts()
+                pid = wait_for_new_pid(prev_pids)
+                if pid:
+                    hwnd = wait_for_hwnd(pid)
+                    if hwnd:
+                        with state_lock:
+                            tracked_accounts[username] = pid
+                            tracked_hwnds[username] = hwnd
+                            launched_accounts.add(username)
+                            error_counter[username] = 0
+                            if username in last_errors:
+                                del last_errors[username]
+                        logging.info(f"[PID]: {pid} [HWND]: {hwnd}")
+                        return True
+                    else:
+                        logging.warning(f"HWND not found for {username}")
+                else:
+                    logging.warning(f"PID not found for {username}")
+            with state_lock:
+                last_errors[username] = ("Launch failed", datetime.now().strftime("%H:%M:%S"))
+        return False
+
+if __name__ == "__main__":
+    app = ModernRobloxManager()
+    app.mainloop()
