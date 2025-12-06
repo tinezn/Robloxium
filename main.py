@@ -23,6 +23,11 @@ import asyncio
 import logging
 import base64
 import queue
+import socket
+import re
+import tkinter as tk
+import win32event
+import msvcrt
 
 try:
     import discord
@@ -34,6 +39,9 @@ except ImportError:
 
 from cryptography.fernet import Fernet
 import hashlib
+import websockets
+from urllib.parse import urlparse, parse_qs
+import pyperclip
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -123,13 +131,13 @@ def log(msg):
 
 def get_active_count():
     count = 0
-    for proc in psutil.process_iter(['name']):
+    for proc in psutil.process_iter(['pid', 'name']):
         if proc.info['name'] == "RobloxPlayerBeta.exe":
             count += 1
     return count
 
 def get_roblox_pids():
-    return {p.pid for p in psutil.process_iter(['name']) if p.info['name'] == ROBLOX_EXE}
+    return {p.info['pid'] for p in psutil.process_iter(['pid', 'name']) if p.info['name'] == ROBLOX_EXE}
 
 def wait_for_new_pid(prev_pids, timeout=60):
     start = time.time()
@@ -302,11 +310,16 @@ class ModernRobloxManager(ctk.CTk):
         self.discord_bot = None
         self.account_widgets = {}  # For optimizing populate_accounts
         self.gui_queue = queue.Queue()
+        self.connected_clients = {}  # username: websocket
+        self.ws_server_thread = None
+        self.multi_roblox_handle = None
+        self.start_ws_server()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self.build_ui()
+        self.enable_multi_roblox()
         self.populate_accounts()
         self.update_active()
         if BOT_TOKEN and DISCORD_AVAILABLE:
@@ -325,7 +338,65 @@ class ModernRobloxManager(ctk.CTk):
             logging.error(f"Queue error: {e}")
         self.after(100, self.process_gui_queue)
 
+    def is_port_in_use(self, port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('localhost', port)) == 0
+
+    async def handle_client(self, websocket):
+        path = websocket.request.path
+        query = urlparse(path).query
+        params = parse_qs(query)
+        username = params.get('name', ['Unknown'])[0]
+        user_id = params.get('id', ['0'])[0]
+
+        if username in self.manager.accounts:
+            logging.info(f"Client connected: {username} (ID: {user_id})")
+            self.connected_clients[username] = websocket
+            self.gui_queue.put(self.populate_accounts)
+
+            try:
+                async for message in websocket:
+                    logging.info(f"Received from {username}: {message}")
+                    if message == 'ping':
+                        await websocket.send('pong')
+            finally:
+                logging.info(f"Client disconnected: {username}")
+                self.connected_clients.pop(username, None)
+                self.gui_queue.put(self.populate_accounts)
+        else:
+            logging.warning(f"Unknown client: {username}")
+            await websocket.close()
+
+    def start_ws_server(self):
+        if self.ws_server_thread:
+            return
+
+        if self.is_port_in_use(5242):
+            logging.error("Port 5242 is in use. Cannot start WS server.")
+            messagebox.showerror("Port Error", "Port 5242 is already in use. Close other instances or programs using it.")
+            return
+
+        async def server():
+            async with websockets.serve(self.handle_client, "localhost", 5242):
+                await asyncio.Future()
+
+        def run_server():
+            asyncio.run(server())
+
+        self.ws_server_thread = threading.Thread(target=run_server, daemon=True)
+        self.ws_server_thread.start()
+        logging.info("WebSocket server started on ws://localhost:5242")
+
+    def on_closing(self):
+        for ws in list(self.connected_clients.values()):
+            try:
+                asyncio.run_coroutine_threadsafe(ws.close(), asyncio.get_event_loop())
+            except:
+                pass
+        self.destroy()
+
     def build_ui(self):
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
         # Main container
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
@@ -427,49 +498,52 @@ class ModernRobloxManager(ctk.CTk):
         btn_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
         btn_frame.grid(row=2, column=0, sticky="ew", padx=18, pady=10)
 
-        def styled_btn(text, cmd, fg="#1a1a1f", hover="#26262e"):
+        def create_styled_btn(parent, text, cmd, fg="#1a1a1f", hover="#26262e", width=148):
             b = ctk.CTkButton(
-                btn_frame, text=text, command=cmd, width=148, height=44,
+                parent, text=text, command=cmd, width=width, height=44,
                 corner_radius=12, fg_color=fg, hover_color=hover,
                 font=ctk.CTkFont(size=14, weight="bold")
             )
             b.pack(fill="x", pady=5)
             return b
 
-        join_btn = styled_btn("Join Server", self.join_server)
+        join_btn = create_styled_btn(btn_frame, "Join Server", self.join_server)
         ToolTip(join_btn, "Join selected accounts to the specified server")
 
-        launch_all_btn = styled_btn("Launch All", self.launch_all)
+        launch_all_btn = create_styled_btn(btn_frame, "Launch All", self.launch_all)
         ToolTip(launch_all_btn, "Launch every account")
 
-        kill_all_btn = styled_btn("Kill All", self.kill_all)
+        kill_all_btn = create_styled_btn(btn_frame, "Kill All", self.kill_all)
         ToolTip(kill_all_btn, "Close all running Roblox instances")
 
         # ==================== 4. CONTROLS (BOTTOM, FIXED) ====================
         bottom_controls = ctk.CTkFrame(main, height=68, fg_color="#131316", corner_radius=14)
         bottom_controls.grid(row=2, column=0, columnspan=2, sticky="ew")
         bottom_controls.grid_propagate(False)
-        for i in range(5):
+        for i in range(6):
             bottom_controls.grid_columnconfigure(i, weight=1)
 
-        def btn(text, cmd, col, fg="#1a1a1f", hover="#26262e"):
+        def create_bottom_btn(parent, text, cmd, col, fg="#1a1a1f", hover="#26262e"):
             b = ctk.CTkButton(
-                bottom_controls, text=text, command=cmd, width=148, height=44,
+                parent, text=text, command=cmd, width=148, height=44,
                 corner_radius=12, fg_color=fg, hover_color=hover,
                 font=ctk.CTkFont(size=14, weight="bold")
             )
             b.grid(row=0, column=col, padx=9, pady=10)
             return b
 
-        add_btn = btn("Add Account", self.add_account_btn, 0)
+        add_btn = create_bottom_btn(bottom_controls, "Add Account", self.add_account_btn, 0)
         ToolTip(add_btn, "Add a new account")
 
-        self.remove_btn = btn("Remove", self.remove_accounts, 1, fg="#2d1122", hover="#551133")
+        self.remove_btn = create_bottom_btn(bottom_controls, "Remove", self.remove_accounts, 1, fg="#2d1122", hover="#551133")
         ToolTip(self.remove_btn, "Remove selected accounts")
         self.remove_btn.configure(state="disabled")
 
-        open_browser_btn = btn("Open Browser", self.open_browser, 2)
+        open_browser_btn = create_bottom_btn(bottom_controls, "Open Browser", self.open_browser, 2)
         ToolTip(open_browser_btn, "Open browser for account management")
+
+        copy_nexus_btn = create_bottom_btn(bottom_controls, "Copy Nexus Lua", self.copy_nexus_to_clipboard, 3)
+        ToolTip(copy_nexus_btn, "Copy Nexus.lua code to clipboard for executor injection")
 
         # Switches on the right
         self.ocr_var = ctk.BooleanVar(value=ERROR_SCAN_ENABLED)
@@ -478,7 +552,7 @@ class ModernRobloxManager(ctk.CTk):
             progress_color="#eee3f7", button_color="#333", button_hover_color="#555",
             font=ctk.CTkFont(size=13), command=self.toggle_ocr
         )
-        ocr_switch.grid(row=0, column=3, padx=20)
+        ocr_switch.grid(row=0, column=4, padx=20)
         ToolTip(ocr_switch, "Enable error detection")
 
         self.report_var = ctk.BooleanVar(value=False)
@@ -487,11 +561,510 @@ class ModernRobloxManager(ctk.CTk):
             progress_color="#eee3f7", button_color="#333", button_hover_color="#555",
             font=ctk.CTkFont(size=13), command=self.toggle_report
         )
-        report_switch.grid(row=0, column=4, padx=20)
+        report_switch.grid(row=0, column=5, padx=20)
         ToolTip(report_switch, "Automatically send account status report to Discord on error")
+
+    def enable_multi_roblox(self):
+        """Enable Multi Roblox + 773 fix"""
+        # hello programmers! I know you're reading this code, because you want to know how did I implement this feature in Python. (and most importantly, the 773 fix)
+        # because of that, I'll leave some comments here to help you understand.
+        import subprocess
+        import win32event
+        import win32api
+        
+        if self.multi_roblox_handle is not None:
+            self.disable_multi_roblox()
+        
+        # hello programmers! I know you're reading this code, because you want to know how did I implement this feature in Python. (and most importantly, the 773 fix)
+        # because of that, I'll leave some comments here to help you understand.
+        try:
+            result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq RobloxPlayerBeta.exe'], 
+                                  capture_output=True, text=True, encoding='utf-8', errors='replace') # checks running processes
+            
+            if result.stdout and 'RobloxPlayerBeta.exe' in result.stdout:
+                response = messagebox.askquestion( # ask user for permission
+                    "Roblox Already Running",
+                    "A Roblox instance is already running.\n\n"
+                    "To use Multi Roblox, you need to close all Roblox instances first.\n\n"
+                    "Do you want to close all Roblox instances now?",
+                    icon='warning'
+                )
+                
+                if response == 'yes':
+                    subprocess.run(['taskkill', '/F', '/IM', 'RobloxPlayerBeta.exe'], 
+                                 capture_output=True, text=True, encoding='utf-8', errors='replace') # closes roblox
+                    messagebox.showinfo("Success", "All Roblox instances have been closed.")
+                else:
+                    return False
+            
+            # then here's the magic:
+            # to enable multi roblox, we create the mutex before roblox creates it.
+            # this means, when roblox starts, it cannot be created by roblox again.
+            # thus, allowing multiple instances to run. Simple, right? (doesn't fix 773 yet)
+            mutex = win32event.CreateMutex(None, True, "ROBLOX_singletonEvent")
+            print("[INFO] Multi Roblox activated.")
+            
+            # check if mutex already existed (GetLastError returns ERROR_ALREADY_EXISTS = 183)
+            if win32api.GetLastError() == 183:
+                print("[WARNING] Mutex already exists. Taking ownership...")
+            
+            # now let's get over on the 773 fix part
+            # first, we need to find the RobloxCookies.dat file
+            cookies_path = os.path.join(
+                os.getenv('LOCALAPPDATA'),
+                r'Roblox\LocalStorage\RobloxCookies.dat'
+            )
+            
+            cookie_file = None
+            if os.path.exists(cookies_path):
+                try:
+                    # to actually apply the 773 fix, we need to lock the cookies file
+                    # this prevents roblox from accessing it, which causes error 773 to not appear
+                    # and there, you have it, multi roblox + 773 fix!
+                    cookie_file = open(cookies_path, 'r+b')
+                    msvcrt.locking(cookie_file.fileno(), msvcrt.LK_NBLCK, os.path.getsize(cookies_path))
+                    print("[INFO] Error 773 fix applied.")
+
+                except OSError:
+                    print("[ERROR] Could not lock RobloxCookies.dat. It may already be locked.")
+
+            else:
+                print("[ERROR] Cookies file not found. 773 fix skipped.")
+
+            self.multi_roblox_handle = {'mutex': mutex, 'file': cookie_file}
+            return True
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to enable Multi Roblox: {str(e)}")
+            return False
+
+    def copy_nexus_to_clipboard(self):
+        nexus_code = """
+if Nexus then Nexus:Stop() end
+
+if not game:IsLoaded() then
+    task.delay(60, function()
+        if NoShutdown then return end
+
+        if not game:IsLoaded() then
+            return game:Shutdown();
+        end
+
+        local Code = game:GetService'GuiService':GetErrorCode().Value
+
+        if Code >= Enum.ConnectionError.DisconnectErrors.Value then
+            return game:Shutdown();
+        end
+    end)
+    
+    game.Loaded:Wait()
+end
+
+local Nexus = {}
+local WSConnect = syn and syn.websocket.connect or
+    (Krnl and (function() repeat task.wait() until Krnl.WebSocket and Krnl.WebSocket.connect return Krnl.WebSocket.connect end)()) or
+    WebSocket and WebSocket.connect
+
+if not WSConnect then
+    if messagebox then
+        messagebox(('Nexus encountered an error while launching!\n\n%s'):format('Your exploit (' .. (identifyexecutor and identifyexecutor() or 'UNKNOWN') .. ') is not supported'), 'Roblox Account Manager', 0)
+    end
+    
+    return
+end
+
+local TeleportService = game:GetService'TeleportService'
+local InputService = game:GetService'UserInputService'
+local HttpService = game:GetService'HttpService'
+local RunService = game:GetService'RunService'
+local GuiService = game:GetService'GuiService'
+local Players = game:GetService'Players'
+local LocalPlayer = Players.LocalPlayer; if not LocalPlayer then repeat LocalPlayer = Players.LocalPlayer task.wait() until LocalPlayer end; task.wait(0.5)
+
+local UGS = UserSettings():GetService'UserGameSettings'
+local OldVolume = UGS.MasterVolume
+
+LocalPlayer.OnTeleport:Connect(function(State)
+    if State == Enum.TeleportState.Started and Nexus.IsConnected then
+        Nexus:Stop() -- Apparently doesn't disconnect websockets on teleport so this has to be here
+    end
+end)
+
+local Signal = {} do
+    Signal.__index = Signal
+
+    function Signal.new()
+        local self = setmetatable({ _BindableEvent = Instance.new'BindableEvent' }, Signal)
+        
+        return self
+    end
+
+    function Signal:Connect(Callback)
+        assert(typeof(Callback) == 'function', 'function expected, got ' .. typeof(Callback))
+
+        return self._BindableEvent.Event:Connect(Callback)
+    end
+
+    function Signal:Fire(...)
+        self._BindableEvent:Fire(...)
+    end
+
+    function Signal:Wait()
+        return self._BindableEvent.Event:Wait()
+    end
+
+    function Signal:Disconnect()
+        if self._BindableEvent then
+            self._BindableEvent:Destroy()
+        end
+    end
+end
+
+do -- Nexus
+    local BTN_CLICK = 'ButtonClicked:'
+
+    Nexus.Connected = Signal.new()
+    Nexus.Disconnected = Signal.new()
+    Nexus.MessageReceived = Signal.new()
+
+    Nexus.Commands = {}
+    Nexus.Connections = {}
+
+    Nexus.ShutdownTime = 45
+    Nexus.ShutdownOnTeleportError = true
+
+    function Nexus:Send(Command, Payload)
+        assert(self.Socket ~= nil, 'websocket is nil')
+        assert(self.IsConnected, 'websocket not connected')
+        assert(typeof(Command) == 'string', 'Command must be a string, got ' .. typeof(Command))
+
+        if Payload then
+            assert(typeof(Payload) == 'table', 'Payload must be a table, got ' .. typeof(Payload))
+        end
+
+        local Message = HttpService:JSONEncode {
+            Name = Command,
+            Payload = Payload
+        }
+
+        self.Socket:Send(Message)
+    end
+
+    function Nexus:SetAutoRelaunch(Enabled)
+        self:Send('SetAutoRelaunch', { Content = Enabled and 'true' or 'false' })
+    end
+    
+    function Nexus:SetPlaceId(PlaceId)
+        self:Send('SetPlaceId', { Content = PlaceId })
+    end
+    
+    function Nexus:SetJobId(JobId)
+        self:Send('SetJobId', { Content = JobId })
+    end
+
+    function Nexus:Echo(Message)
+        self:Send('Echo', { Content = Message })
+    end
+
+    function Nexus:Log(...)
+        local T = {}
+
+        for Index, Value in pairs{ ... } do
+            table.insert(T, tostring(Value))
+        end
+
+        self:Send('Log', {
+            Content = table.concat(T, ' ')
+        })
+    end
+
+    function Nexus:CreateElement(ElementType, Name, Content, Size, Margins, Table)
+        assert(typeof(Name) == 'string', 'string expected on argument #1, got ' .. typeof(Name))
+        assert(typeof(Content) == 'string', 'string expected on argument #2, got ' .. typeof(Content))
+
+        assert(Name:find'%W' == nil, 'argument #1 cannot contain whitespace')
+
+        if Size then assert(typeof(Size) == 'table' and #Size == 2, 'table with 2 arguments expected on argument #3, got ' .. typeof(Size)) end
+        if Margins then assert(typeof(Margins) == 'table' and #Margins == 4, 'table with 4 arguments expected on argument #4, got ' .. typeof(Margins)) end
+        
+        local Payload = {
+            Name = Name,
+            Content = Content,
+            Size = Size and table.concat(Size, ','),
+            Margin = Margins and table.concat(Margins, ',')
+        }
+
+        if Table then
+            for Index, Value in pairs(Table) do
+                Payload[Index] = Value
+            end
+        end
+
+        self:Send(ElementType, Payload)
+    end
+
+    function Nexus:CreateButton(...)
+        return self:CreateElement('CreateButton', ...)
+    end
+
+    function Nexus:CreateTextBox(...)
+        return self:CreateElement('CreateTextBox', ...)
+    end
+
+    function Nexus:CreateNumeric(Name, Value, DecimalPlaces, Increment, Size, Margins)
+        return self:CreateElement('CreateNumeric', Name, tostring(Value), Size, Margins, { DecimalPlaces = DecimalPlaces, Increment = Increment })
+    end
+
+    function Nexus:CreateLabel(...)
+        return self:CreateElement('CreateLabel', ...)
+    end
+
+    function Nexus:NewLine(...)
+        return self:Send('NewLine')
+    end
+
+    function Nexus:GetText(Name)
+        return self:WaitForMessage('ElementText:', 'GetText', { Name = Name })
+    end
+
+    function Nexus:SetRelaunch(Seconds)
+        self:Send('SetRelaunch', { Seconds = Seconds })
+    end
+
+    function Nexus:WaitForMessage(Header, Message, Payload)
+        if Message then
+            task.defer(self.Send, self, Message, Payload)
+        end
+
+        local Message
+
+        while true do
+            Message = self.MessageReceived:Wait()
+
+            if Message:sub(1, #Header) == Header then
+                break
+            end
+        end
+
+        return Message:sub(#Header + 1)
+    end
+
+    function Nexus:Connect(Host, Bypass)
+        if not Bypass and self.IsConnected then return 'Ignoring connection request, Nexus is already connected' end
+
+        while true do
+            for Index, Connection in pairs(self.Connections) do
+                Connection:Disconnect()
+            end
+        
+            table.clear(self.Connections)
+
+            if self.IsConnected then
+                self.IsConnected = false
+                self.Socket = nil
+                self.Disconnected:Fire()
+            end
+
+            if self.Terminated then break end
+
+            if not Host then
+                Host = 'localhost:5242'
+            end
+
+            local Success, Socket = pcall(WSConnect, ('ws://%s/Nexus?name=%s&id=%s&jobId=%s'):format(Host, LocalPlayer.Name, LocalPlayer.UserId, game.JobId))
+
+            if not Success then task.wait(12) continue end
+
+            self.Socket = Socket
+            self.IsConnected = true
+
+            table.insert(self.Connections, Socket.OnMessage:Connect(function(Message)
+                self.MessageReceived:Fire(Message)
+            end))
+
+            table.insert(self.Connections, Socket.OnClose:Connect(function()
+                self.IsConnected = false
+                self.Disconnected:Fire()
+            end))
+
+            self.Connected:Fire()
+
+            while self.IsConnected do
+                local Success, Error = pcall(self.Send, self, 'ping')
+
+                if not Success or self.Terminated then
+                    break
+                end
+
+                task.wait(5)
+            end
+        end
+    end
+
+    function Nexus:Stop()
+        self.IsConnected = false
+        self.Terminated = true
+        self.Disconnected:Fire()
+
+        if self.Socket then
+            pcall(function() self.Socket:Close() end)
+        end
+    end
+
+    function Nexus:AddCommand(Name, Function)
+        self.Commands[Name] = Function
+    end
+
+    function Nexus:RemoveCommand(Name)
+        self.Commands[Name] = nil
+    end
+
+    function Nexus:OnButtonClick(Name, Function)
+        self:AddCommand('ButtonClicked:' .. Name, Function)
+    end
+
+    Nexus.MessageReceived:Connect(function(Message)
+        local S = Message:find(' ')
+
+        if S then
+            local Command, Message = Message:sub(1, S - 1):lower(), Message:sub(S + 1)
+
+            if Nexus.Commands[Command] then
+                local Success, Error = pcall(Nexus.Commands[Command], Message)
+
+                if not Success and Error then
+                    Nexus:Log(('Error with command `%s`: %s'):format(Command, Error))
+                end
+            end
+        elseif Nexus.Commands[Message] then
+            local Success, Error = pcall(Nexus.Commands[Message], Message)
+
+            if not Success and Error then
+                Nexus:Log(('Error with command `%s`: %s'):format(Message, Error))
+            end
+        end
+    end)
+end
+
+do -- Default Commands
+    Nexus:AddCommand('execute', function(Message)
+        local Function, Error = loadstring(Message)
+        
+        if Function then
+            local Env = getfenv(Function)
+            
+            Env.Player = LocalPlayer
+            Env.print = function(...)
+                local T = {}
+
+                for Index, Value in pairs{ ... } do
+                    table.insert(T, tostring(Value))
+                end
+
+                Nexus:Log(table.concat(T, ' '))
+            end
+
+            if newcclosure then Env.print = newcclosure(Env.print) end
+
+            local S, E = pcall(Function)
+
+            if not S then
+                Nexus:Log(E)
+            end
+        else
+            Nexus:Log(Error)
+        end
+    end)
+
+    Nexus:AddCommand('teleport', function(Message)
+        local S = Message:find(' ')
+        local PlaceId, JobId = S and Message:sub(1, S - 1) or Message, S and Message:sub(S + 1)
+        
+        if JobId then
+            TeleportService:TeleportToPlaceInstance(tonumber(PlaceId), JobId)
+        else
+            TeleportService:Teleport(tonumber(PlaceId))
+        end
+    end)
+
+    Nexus:AddCommand('rejoin', function(Message)
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId)
+    end)
+
+    Nexus:AddCommand('mute', function()
+        if (UGS.MasterVolume - OldVolume) > 0.01 then
+            OldVolume = UGS.MasterVolume
+        end
+
+        UGS.MasterVolume = 0
+    end)
+
+    Nexus:AddCommand('unmute', function()
+        UGS.MasterVolume = OldVolume
+    end)
+
+    Nexus:AddCommand('performance', function(Message)
+        if _PERF then return end
+        
+        _PERF = true
+        _TARGETFPS = 8
+
+        if Message and tonumber(Message) then
+            _TARGETFPS = tonumber(Message)
+        end
+
+        local OldLevel = settings().Rendering.QualityLevel
+
+        RunService:Set3dRenderingEnabled(false)
+        settings().Rendering.QualityLevel = 1
+
+        InputService.WindowFocused:Connect(function()
+            RunService:Set3dRenderingEnabled(true)
+            settings().Rendering.QualityLevel = OldLevel
+            setfpscap(60)
+        end)
+
+        InputService.WindowFocusReleased:Connect(function()
+            OldLevel = settings().Rendering.QualityLevel
+
+            RunService:Set3dRenderingEnabled(false)
+            settings().Rendering.QualityLevel = 1
+            setfpscap(_TARGETFPS)
+        end)
+
+        setfpscap(_TARGETFPS)
+    end)
+end
+
+do -- Connections
+    GuiService.ErrorMessageChanged:Connect(function()
+        if NoShutdown then return end
+
+        local Code = GuiService:GetErrorCode().Value
+
+        if Code >= Enum.ConnectionError.DisconnectErrors.Value then
+            if not Nexus.ShutdownOnTeleportError and Code > Enum.ConnectionError.PlacelaunchOtherError.Value then
+                return
+            end
+            
+            task.delay(Nexus.ShutdownTime, game.Shutdown, game)
+        end
+    end)
+end
+
+local GEnv = getgenv()
+GEnv.Nexus = Nexus
+GEnv.performance = Nexus.Commands.performance -- fix the sirmeme error so that people stop being annoying saying "omg performance() doesnt work"
+
+if not Nexus_Version then
+    Nexus:Connect()
+end
+"""
+        pyperclip.copy(nexus_code)
+        messagebox.showinfo("Copied", "Nexus.lua copied to clipboard. Paste and execute in your executor for each Roblox instance.")
 
     def populate_accounts(self):
         current_usernames = set(self.manager.accounts.keys())
+        sorted_usernames = sorted(current_usernames)  # Cache sorted list
 
         # Remove widgets for deleted accounts
         for username in list(self.account_widgets.keys()):
@@ -502,10 +1075,12 @@ class ModernRobloxManager(ctk.CTk):
         self.check_vars = {u: v for u, v in self.check_vars.items() if u in current_usernames}
         self.selected_accounts = {u for u in self.selected_accounts if u in current_usernames}
 
-        for i, (username, data) in enumerate(sorted(self.manager.accounts.items())):
+        for i, username in enumerate(sorted_usernames):
+            data = self.manager.accounts[username]
             with state_lock:
                 online = username in launched_accounts and username in tracked_accounts and username in tracked_hwnds and psutil.pid_exists(tracked_accounts[username]) and win32gui.IsWindow(tracked_hwnds[username])
                 err = username in last_errors
+                connected = username in self.connected_clients
 
             if username not in self.account_widgets:
                 card = ctk.CTkFrame(self.accounts_frame, height=62, corner_radius=12,
@@ -536,6 +1111,9 @@ class ModernRobloxManager(ctk.CTk):
                 kill_btn = ctk.CTkButton(card, text="Kill", width=66, fg_color="#3d1122", hover_color="#6b1a44")
                 kill_btn.grid(row=0, column=5, padx=5)
 
+                script_btn = ctk.CTkButton(card, text="Script", width=88, fg_color="#1a6333", hover_color="#2d8a4d")
+                script_btn.grid(row=0, column=6, padx=5)
+
                 self.account_widgets[username] = {
                     'card': card,
                     'checkbox': checkbox,
@@ -544,7 +1122,8 @@ class ModernRobloxManager(ctk.CTk):
                     'status_label': status_label,
                     'game_label': game_label,
                     'restart_btn': restart_btn,
-                    'kill_btn': kill_btn
+                    'kill_btn': kill_btn,
+                    'script_btn': script_btn
                 }
 
                 var.trace_add("write", self.update_selection)
@@ -553,6 +1132,8 @@ class ModernRobloxManager(ctk.CTk):
             color = "#00ff88" if online else ("#ff3b5c" if err else "#666")
             widgets['status_dot'].configure(text_color=color)
             status_text = "ONLINE" if online else ("ERROR" if err else "OFFLINE")
+            if connected:
+                status_text += " (Connected)"
             widgets['status_label'].configure(text=status_text, text_color=color)
 
             if online:
@@ -567,7 +1148,138 @@ class ModernRobloxManager(ctk.CTk):
                 widgets['restart_btn'].grid_remove()
                 widgets['kill_btn'].grid_remove()
 
+            if connected:
+                widgets['script_btn'].configure(command=lambda n=username: self.open_script_editor(n))
+                widgets['script_btn'].grid()
+            else:
+                widgets['script_btn'].grid_remove()
+
+            ToolTip(widgets['script_btn'], "Open script editor for this account")
+
         self.update_selection()
+
+    def open_script_editor(self, username):
+        if username not in self.connected_clients:
+            messagebox.showerror("Error", "Account not connected via Nexus. Inject Nexus.lua first.")
+            return
+
+        editor_win = ctk.CTkToplevel(self)
+        editor_win.title(f"Script Editor - {username}")
+        editor_win.geometry("700x500")
+        editor_win.minsize(600, 400)
+        editor_win.configure(fg_color="#0a0a0a")
+
+        # Main frame with padding
+        main_frame = ctk.CTkFrame(editor_win, fg_color="#111114", corner_radius=14)
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Title label
+        title_label = ctk.CTkLabel(main_frame, text="Lua Script Editor", font=ctk.CTkFont(size=18, weight="bold"))
+        title_label.pack(pady=(10, 5))
+
+        # Instruction label
+        instr_label = ctk.CTkLabel(main_frame, text="Enter Lua code to execute on this Roblox instance", 
+                                   font=ctk.CTkFont(size=13), text_color="#aaaaaa")
+        instr_label.pack(pady=(0, 10))
+
+        # Editor frame
+        editor_frame = ctk.CTkFrame(main_frame, fg_color="#1a1a1a", corner_radius=10)
+        editor_frame.pack(fill="both", expand=True, pady=5)
+
+        # Line numbers
+        line_frame = ctk.CTkFrame(editor_frame, width=50, fg_color="#2b2b2b", corner_radius=0)
+        line_frame.pack(side="left", fill="y")
+        line_numbers = tk.Text(line_frame, width=4, padx=8, pady=8, takefocus=0, bd=0, bg="#2b2b2b", fg="#ffffff", 
+                               state='disabled', wrap='none', font=("Consolas", 13))
+        line_numbers.pack(fill="y")
+
+        # Text box
+        text_box = ctk.CTkTextbox(editor_frame, font=ctk.CTkFont(family="Consolas", size=13), wrap='none', 
+                                  fg_color="#1a1a1a", text_color="#ffffff", corner_radius=0, border_width=0)
+        text_box.pack(side="left", fill="both", expand=True, padx=(0, 0), pady=0)
+
+        # Syntax highlighting setup
+        repl_dict = {
+            "keyword": (re.compile(r'\b(and|break|do|else|elseif|end|false|for|function|goto|if|in|local|nil|not|or|repeat|return|then|true|until|while)\b'), "#F92672"),
+            "string": (re.compile(r'".*?"|\'.*?\'|\[=.*?\=]'), "#E6DB74"),
+            "comment": (re.compile(r'--.*'), "#75715E"),
+            "number": (re.compile(r'\b\d+\.?\d*\b'), "#AE81FF"),
+        }
+
+        for tag, (pattern, color) in repl_dict.items():
+            text_box.tag_config(tag, foreground=color)
+
+        def highlight_syntax(event=None):
+            text = text_box.get("1.0", "end")
+            for tag in repl_dict:
+                text_box.tag_remove(tag, "1.0", "end")
+                for match in repl_dict[tag][0].finditer(text):
+                    start = f"1.0 + {match.start()} chars"
+                    end = f"1.0 + {match.end()} chars"
+                    text_box.tag_add(tag, start, end)
+
+        def update_line_numbers(event=None):
+            line_numbers.config(state='normal')
+            line_numbers.delete('1.0', 'end')
+            lines = int(text_box.index('end-1c').split('.')[0])
+            for i in range(1, lines + 1):
+                line_numbers.insert('end', f"{i}\n")
+            line_numbers.config(state='disabled')
+
+        def sync_scroll(first, last):
+            line_numbers.yview("moveto", first)
+
+        text_box.configure(yscrollcommand=sync_scroll)
+        # Note: Removed line_numbers.yscrollcommand to prevent loop and invalid calls
+
+        text_box.bind("<KeyRelease>", lambda e: (highlight_syntax(), update_line_numbers()))
+
+        # Initial update
+        highlight_syntax()
+        update_line_numbers()
+
+        # Buttons frame
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(pady=10, fill="x", padx=20)
+
+        execute_btn = ctk.CTkButton(btn_frame, text="Execute", command=lambda: self.execute_script(username, text_box.get("1.0", "end")),
+                                    fg_color="#1a6333", hover_color="#2d8a4d", width=140, height=40,
+                                    font=ctk.CTkFont(size=14, weight="bold"))
+        execute_btn.pack(side="right", padx=(10, 0))
+
+        def save_to_file():
+            code = text_box.get("1.0", "end").strip()
+            if not code:
+                messagebox.showwarning("Empty", "No code to save.")
+                return
+            file_path = f"scripts/{username}.lua"
+            os.makedirs("scripts", exist_ok=True)
+            with open(file_path, "w") as f:
+                f.write(code)
+            messagebox.showinfo("Saved", f"Script saved to {file_path}")
+
+        save_btn = ctk.CTkButton(btn_frame, text="Save to File", command=save_to_file,
+                                 fg_color="#2b2b2b", hover_color="#3d3d3d", width=140, height=40,
+                                 font=ctk.CTkFont(size=14, weight="bold"))
+        save_btn.pack(side="right", padx=(10, 0))
+
+        close_btn = ctk.CTkButton(btn_frame, text="Close", command=editor_win.destroy,
+                                  fg_color="#3d1122", hover_color="#6b1a44", width=140, height=40,
+                                  font=ctk.CTkFont(size=14, weight="bold"))
+        close_btn.pack(side="right")
+
+    def execute_script(self, username, code):
+        ws = self.connected_clients.get(username)
+        if ws:
+            code = code.strip()
+            if code:
+                asyncio.run_coroutine_threadsafe(ws.send(f"execute {code}"), asyncio.get_event_loop())
+                logging.info(f"Executed script on {username}")
+                messagebox.showinfo("Success", "Script sent to execute on this account only.")
+            else:
+                messagebox.showwarning("Empty", "No code to execute.")
+        else:
+            messagebox.showerror("Error", "Connection lost.")
 
     def update_selection(self, *args):
         self.selected_accounts = {u for u, v in self.check_vars.items() if v.get()}
@@ -605,7 +1317,7 @@ class ModernRobloxManager(ctk.CTk):
     def _join_server_thread(self, place_id, job_id):
         for username in list(self.selected_accounts):
             self.manager.launch_roblox(username, place_id, job_id=job_id)
-            time.sleep(2)
+            time.sleep(1)  # Reduced delay
 
     def launch_all(self):
         place_id, job_id = self.get_server_info()
@@ -619,7 +1331,7 @@ class ModernRobloxManager(ctk.CTk):
     def _launch_all_thread(self, place_id, job_id):
         for username in list(self.manager.accounts.keys()):
             self.manager.launch_roblox(username, place_id, job_id=job_id)
-            time.sleep(2)
+            time.sleep(1)  # Reduced delay
 
     def kill_all(self):
         with state_lock:
@@ -649,10 +1361,14 @@ class ModernRobloxManager(ctk.CTk):
 
     def scan_loop(self):
         while self.ocr_var.get():
+            with state_lock:
+                if not tracked_hwnds:
+                    time.sleep(15)
+                    continue
             self.check_account_statuses()
             self.check_accounts_for_errors()
             self.gui_queue.put(lambda: self.populate_accounts())
-            time.sleep(10)
+            time.sleep(15)  # Increased interval
 
     def toggle_report(self):
         enabled = self.report_var.get()
@@ -661,7 +1377,7 @@ class ModernRobloxManager(ctk.CTk):
     def update_active(self):
         active = get_active_count()
         self.active_label.configure(text=f"{active} active")
-        self.after(10000, self.update_active)  # Increased interval
+        self.after(30000, self.update_active)  # Increased interval
 
     def get_server_info(self):
         place_id = self.place_entry.get().strip()
@@ -711,16 +1427,17 @@ class ModernRobloxManager(ctk.CTk):
 
     def _relaunch_account(self, u, delay):
         time.sleep(delay)
-        server = self.manager.accounts.get(u, {}).get('current_server', {})
-        place_id = server.get('place_id')
-        job_id = server.get('job_id')
+        with state_lock:
+            server = self.manager.accounts.get(u, {}).get('current_server', {})
+            place_id = server.get('place_id')
+            job_id = server.get('job_id')
         if place_id:
             self.manager.launch_roblox(u, place_id, job_id=job_id)
 
     def check_accounts_for_errors(self):
         with state_lock:
             for name, hwnd in list(tracked_hwnds.items()):
-                if not win32gui.IsWindow(hwnd):
+                if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
                     continue
                 try:
                     win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
@@ -771,7 +1488,8 @@ class ModernRobloxManager(ctk.CTk):
         threading.Thread(target=func, daemon=True).start()
 
     def restart_account(self, name):
-        self.handle_manual_remove(name)
+        with state_lock:
+            self.handle_manual_remove(name)
         server = self.manager.accounts.get(name, {}).get('current_server', {})
         place_id = server.get('place_id')
         job_id = server.get('job_id')
@@ -891,8 +1609,10 @@ class ModernRobloxManager(ctk.CTk):
         if not BOT_TOKEN:
             messagebox.showerror("Error", "Bot token required")
             return
-        if self.discord_bot:
+        global _bot_running
+        if _bot_running:
             return
+        _bot_running = True
         self.discord_bot = DiscordBot(self)
         threading.Thread(target=self.discord_bot.bot.run, args=(BOT_TOKEN,), daemon=True).start()
 
@@ -1143,6 +1863,7 @@ class RobloxAPI:
         logging.info(f"Launching Roblox...")
         logging.info(f"Account: {username}")
         logging.info(f"Game ID: {game_id}")
+        
         if job_id:
             logging.info(f"Job ID: {job_id}")
 
@@ -1404,9 +2125,9 @@ class RobloxAccountManager:
                 url.includes('/transactions') || url.includes('/my/avatar') ||
                 url.includes('/users/profile') || url.includes('roblox.com/users/') && !url.includes('/login')) {
             
-                // Add cookie check after URL match
+                # Add cookie check after URL match
                 if (document.cookie.includes('.ROBLOSECURITY')) {
-                    window.ultraFastDetection.detected = true;
+                    window.ultraFastDetection.detected = true
                     window.ultraFastDetection.method = 'url_with_cookie';
                     window.ultraFastDetection.debug.push('✅ DETECTED via URL and cookie! Page: ' + url');
                     window.ultraFastDetection.cleanup();
@@ -1475,11 +2196,6 @@ class RobloxAccountManager:
                 if current_time - last_debug_time > 5:
                     last_debug_time = current_time
                     current_url = driver.current_url
-                    logging.info(f"Still checking... Current URL: {current_url}")
-                    if result and result.get('debug'):
-                        recent_debug = result.get('debug', [])[-3:]
-                        for debug_msg in recent_debug:
-                            logging.info(f"Debug: {debug_msg}")
                     if ('/home' in current_url or '/games' in current_url or 
                         '/catalog' in current_url or '/avatar' in current_url or
                         '/discover' in current_url or '/friends' in current_url or
@@ -1568,11 +2284,11 @@ class RobloxAccountManager:
     def add_account(self, amount=1, website="https://www.roblox.com/login", javascript=""):
         """
         Add accounts through browser login with optional Javascript execution
-        amount: number of browser instances to open (max 5)
+        amount: number of browser instances to open (max 3)
         website: URL to navigate to
         javascript: Javascript code to execute after page load
         """
-        amount = min(amount, 5)  # Limit to 5
+        amount = min(amount, 3)  # Limit to 3
         
         success_count = 0
         drivers = []
