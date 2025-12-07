@@ -28,6 +28,7 @@ import re
 import tkinter as tk
 import win32event
 import msvcrt
+from PIL import Image
 
 try:
     import discord
@@ -297,10 +298,15 @@ class DiscordBot:
 class ModernRobloxManager(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Roblox Watcher -by Tinezn")
+        self.title("Robloxium")
         self.geometry("1100x680")
         self.minsize(980, 600)
         self.configure(fg_color="#0a0a0a")
+
+        # Load images
+        self.logo_img = self.iconbitmap("assets/logo.ico")
+        banner_pil = Image.open("assets/banner.png")
+        self.banner_image = ctk.CTkImage(light_image=banner_pil, dark_image=banner_pil, size=(banner_pil.width // 2, banner_pil.height // 2))  # Scale if necessary; adjust as needed
 
         self.manager = RobloxAccountManager(password="default")  # Use a secure password in production
         self.settings_window = None
@@ -409,8 +415,7 @@ class ModernRobloxManager(ctk.CTk):
         top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         top_bar.grid_propagate(False)
 
-        ctk.CTkLabel(top_bar, text="Roblox Multi-Account Watcher", 
-                     font=ctk.CTkFont(size=24, weight="bold")).pack(side="left", padx=24, pady=20)
+        ctk.CTkLabel(top_bar, image=self.banner_image, text="").pack(side="left", padx=24, pady=20)
 
         # Right side: Status + Buttons
         right_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
@@ -543,7 +548,8 @@ class ModernRobloxManager(ctk.CTk):
         ToolTip(open_browser_btn, "Open browser for account management")
 
         copy_nexus_btn = create_bottom_btn(bottom_controls, "Copy Nexus Lua", self.copy_nexus_to_clipboard, 3)
-        ToolTip(copy_nexus_btn, "Copy Nexus.lua code to clipboard for executor injection")
+        copy_nexus_btn.configure(state="disabled")
+        ToolTip(copy_nexus_btn, "In development: Nexus")
 
         # Switches on the right
         self.ocr_var = ctk.BooleanVar(value=ERROR_SCAN_ENABLED)
@@ -666,7 +672,7 @@ local WSConnect = syn and syn.websocket.connect or
 
 if not WSConnect then
     if messagebox then
-        messagebox(('Nexus encountered an error while launching!\n\n%s'):format('Your exploit (' .. (identifyexecutor and identifyexecutor() or 'UNKNOWN') .. ') is not supported'), 'Roblox Account Manager', 0)
+        messagebox(('Nexus encountered an error while launching!%s'):format('Your exploit (' .. (identifyexecutor and identifyexecutor() or 'UNKNOWN') .. ') is not supported'), 'Roblox Account Manager', 0)
     end
     
     return
@@ -1207,16 +1213,16 @@ end
         }
 
         for tag, (pattern, color) in repl_dict.items():
-            text_box.tag_config(tag, foreground=color)
+            text_box._textbox.tag_config(tag, foreground=color)
 
         def highlight_syntax(event=None):
             text = text_box.get("1.0", "end")
             for tag in repl_dict:
-                text_box.tag_remove(tag, "1.0", "end")
+                text_box._textbox.tag_remove(tag, "1.0", "end")
                 for match in repl_dict[tag][0].finditer(text):
                     start = f"1.0 + {match.start()} chars"
                     end = f"1.0 + {match.end()} chars"
-                    text_box.tag_add(tag, start, end)
+                    text_box._textbox.tag_add(tag, start, end)
 
         def update_line_numbers(event=None):
             line_numbers.config(state='normal')
@@ -1618,7 +1624,7 @@ end
 
     def show_help(self):
         help_text = """
-Roblox Multi-Account Watcher – Complete Guide (2025)
+Robloxium – Complete Guide (2025)
 
 1. First-Time Discord Bot Setup
    • Go to: https://discord.com/developers/applications
@@ -1691,7 +1697,7 @@ You're all set — enjoy flawless multi-account farming!
 
         dialog = ctk.CTkToplevel(self)
         self.help_window = dialog
-        dialog.title("How to Use – Roblox Multi-Account Watcher")
+        dialog.title("How to Use – Robloxium")
         dialog.geometry("760x680")
         dialog.resizable(False, False)
         dialog.configure(fg_color="#0f0f0f")
@@ -1712,7 +1718,7 @@ You're all set — enjoy flawless multi-account farming!
 
         ctk.CTkLabel(
             dialog,
-            text="How to Use – Roblox Multi-Account Watcher",
+            text="How to Use – Robloxium",
             font=ctk.CTkFont(size=19, weight="bold"),
             text_color="#e0e0e0"
         ).pack(pady=(24, 12))
@@ -1842,8 +1848,8 @@ class RobloxAPI:
                 return False
 
         if job_id:
-            request_type = "RequestGame"
-            extra_params = f"&linkCode={job_id}"
+            request_type = "RequestPrivateGame"
+            extra_params = f"&privateServerLinkCode={job_id}"
         else:
             request_type = "RequestGame"
             extra_params = ""
