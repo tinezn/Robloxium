@@ -6,6 +6,7 @@ import threading
 import subprocess
 import psutil
 import os
+from launcher_detect import detect_custom_launcher
 import time
 import random
 import requests
@@ -2278,8 +2279,14 @@ class RobloxAPI:
             print(f"Link code: {link_code}")
 
         try:
-            os.system(f'start "" "{url}"')
-            print("[SUCCESS] Roblox launched successfully!")
+            launcher_path = detect_custom_launcher()
+            if launcher_path:
+                # Use the detected launcher to open the roblox-player URL
+                subprocess.Popen([launcher_path, url])
+                print(f"[SUCCESS] Launched Roblox using custom launcher: {launcher_path}")
+            else:
+                os.system(f'start "" "{url}"')
+                print("[SUCCESS] Roblox launched successfully!")
             return True
         except Exception as e:
             print(f"[ERROR] Failed to launch Roblox: {e}")
