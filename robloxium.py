@@ -348,13 +348,10 @@ class DiscordBot:
 class ModernRobloxManager(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.title("Robloxium")
         self.geometry("1100x680")
         self.minsize(980, 600)
         self.configure(fg_color="#0a0a0a")
-
-        # Use default OS window decorations (no overrideredirect)
 
         # Load images
         self.iconbitmap("assets/logo.ico")
@@ -373,6 +370,18 @@ class ModernRobloxManager(ctk.CTk):
         self.ws_server_thread = None
         self.multi_roblox_handle = None
         self.start_ws_server()
+
+        # Load persistent history
+        self.history_file = os.path.join(os.path.dirname(__file__), "AccountManagerData", "history.json")
+        os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+        if not os.path.exists(self.history_file):
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump({"place_history": [], "job_history": []}, f, indent=2)
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                self.history = json.load(f)
+        except Exception:
+            self.history = {"place_history": [], "job_history": []}
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -464,6 +473,12 @@ class ModernRobloxManager(ctk.CTk):
         config['last_job_id'] = self.job_entry.get().strip()
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4)
+        # Save persistent history
+        try:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.history, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save history: {e}")
         self.destroy()
 
     def build_ui(self):
@@ -486,19 +501,9 @@ class ModernRobloxManager(ctk.CTk):
         right_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
         right_frame.pack(side="right", padx=18, pady=20)
 
-
-        # Settings & Help buttons with better icons
-        try:
-            settings_img = ctk.CTkImage(light_image=Image.open("assets/settings.png"), dark_image=Image.open("assets/settings.png"), size=(28, 28))
-        except Exception:
-            settings_img = None
-        try:
-            help_img = ctk.CTkImage(light_image=Image.open("assets/help.png"), dark_image=Image.open("assets/help.png"), size=(35, 35))
-        except Exception:
-            help_img = None
-
+        # Settings & Help buttons
         settings_btn = ctk.CTkButton(
-            right_frame, image=settings_img, text="" if settings_img else "⚙", width=36, height=36, corner_radius=20,
+            right_frame, text="⚙", width=36, height=36, corner_radius=20,
             fg_color="#111114", hover_color="#111114", font=ctk.CTkFont(size=20),
             command=self.open_settings
         )
@@ -506,7 +511,7 @@ class ModernRobloxManager(ctk.CTk):
         ToolTip(settings_btn, "Open Settings (Discord Bot Token, etc.)")
 
         help_btn = ctk.CTkButton(
-            right_frame, image=help_img, text="" if help_img else "❓", width=36, height=36, corner_radius=18,
+            right_frame, text="❓", width=36, height=36, corner_radius=18,
             fg_color="#111114", hover_color="#111114", font=ctk.CTkFont(size=18),
             command=self.show_help
         )
@@ -517,8 +522,8 @@ class ModernRobloxManager(ctk.CTk):
         self.status_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
         self.status_frame.pack(side="right", padx=(0, 20))
 
-        self.active_label = ctk.CTkLabel(self.status_frame, text="0 active", font=ctk.CTkFont(size=14, weight="bold"), text_color="#888", width=80, anchor="w")
-        self.active_label.pack(side="left")
+        self.discord_status_label = ctk.CTkLabel(self.status_frame, text="Discord: Offline", font=ctk.CTkFont(size=14), text_color="#ff4444", width=140, anchor="w")
+        self.discord_status_label.pack(side="right", padx=(0, 24))
 
         self.ocr_label = ctk.CTkLabel(self.status_frame, text=" • OCR: OFF", font=ctk.CTkFont(size=14), text_color="#888", width=90, anchor="w")
         self.ocr_label.pack(side="left", padx=(8, 0))
@@ -526,10 +531,10 @@ class ModernRobloxManager(ctk.CTk):
         self.report_label = ctk.CTkLabel(self.status_frame, text=" • Report: OFF", font=ctk.CTkFont(size=14), text_color="#888", width=110, anchor="w")
         self.report_label.pack(side="left", padx=(8, 0))
 
-        self.discord_status_label = ctk.CTkLabel(
-            right_frame, text="Discord: Offline", font=ctk.CTkFont(size=14), text_color="#ff4444", width=140, anchor="w"
+        self.active_label = ctk.CTkLabel(
+            right_frame, text="0 active", font=ctk.CTkFont(size=14, weight="bold"), text_color="#888", width=80, anchor="w"
         )
-        self.discord_status_label.pack(side="right", padx=(0, 24))
+        self.active_label.pack(side="left")
 
         # ==================== 2. ACCOUNTS PANEL (LEFT, EXPANDABLE) ====================
         accounts_panel = ctk.CTkFrame(main, fg_color="#111114", corner_radius=16)
@@ -566,15 +571,198 @@ class ModernRobloxManager(ctk.CTk):
         input_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
         input_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=10)
 
-        ctk.CTkLabel(input_frame, text="Place ID").pack(anchor="w")
-        self.place_entry = ctk.CTkEntry(input_frame)
-        self.place_entry.pack(fill="x", pady=5)
-        self.place_entry.insert(0, config.get("last_place_id", ""))
+        # --- Custom Dropdown for Place ID ---
+        # Row for Place ID label and game name label
+        place_label_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        place_label_row.pack(anchor="w", fill="x")
+        ctk.CTkLabel(place_label_row, text="Place ID").pack(side="left")
+        self.place_game_label = ctk.CTkLabel(place_label_row, text="", font=ctk.CTkFont(size=12), text_color="#aaa")
+        self.place_game_label.pack(side="left", padx=(8, 0))
+        self.place_entry_var = ctk.StringVar(value=config.get("last_place_id", ""))
+        place_entry_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        place_entry_row.pack(fill="x", pady=5)
+        self.place_entry = ctk.CTkEntry(place_entry_row, textvariable=self.place_entry_var)
+        self.place_entry.pack(side="left", fill="x", expand=True)
 
+        def update_place_game_label(event=None):
+            place_id = self.place_entry_var.get().strip()
+            if place_id.isdigit():
+                self.place_game_label.configure(text="Loading...")
+                def fetch_and_update():
+                    name = RobloxAPI.get_game_name(place_id)
+                    if name:
+                        self.place_game_label.configure(text=f"{name}")
+                    else:
+                        self.place_game_label.configure(text="")
+                threading.Thread(target=fetch_and_update, daemon=True).start()
+            else:
+                self.place_game_label.configure(text="")
+
+        # Update label when Place ID changes
+        self.place_entry_var.trace_add("write", lambda *a: update_place_game_label())
+        # Also update when selecting from dropdown
+        def select_place_history(val):
+            self.place_entry_var.set(val)
+            hide_place_dropdown()
+            update_place_game_label()
+
+        update_place_game_label()
+
+        # Place ID dropdown logic (functions must be defined before button)
+        self.place_history = list(self.history.get("place_history", []))[-5:]
+        self.place_dropdown = None
+
+        # Cache for place_id -> game name
+        self.place_id_name_cache = {}
+
+        def show_place_dropdown(event=None):
+            if self.place_dropdown:
+                self.place_dropdown.destroy()
+                self.place_dropdown = None
+                return
+            if not self.place_history:
+                return
+            self.place_dropdown = ctk.CTkFrame(input_frame, fg_color="#23232a", corner_radius=8)
+            self.place_dropdown.place(in_=self.place_entry, relx=0, rely=1, relwidth=1)
+
+            def make_btn(place_id):
+                # Use cached name if available, else fetch
+                name = self.place_id_name_cache.get(place_id)
+                if name is None:
+                    name = RobloxAPI.get_game_name(place_id)
+                    self.place_id_name_cache[place_id] = name or "(Unknown)"
+                display = name or "(Unknown)"
+                btn = ctk.CTkButton(self.place_dropdown, text=display, width=1, height=28, fg_color="#23232a", hover_color="#333348", anchor="w",
+                                    font=ctk.CTkFont(size=13), command=lambda v=place_id: select_place_history(v))
+                btn.pack(fill="x")
+
+            for val in reversed(self.place_history):
+                make_btn(val)
+
+        def hide_place_dropdown(event=None):
+            # Store current input in history if valid, not empty, and not duplicate
+            val = self.place_entry_var.get().strip()
+            if val.isdigit() and val not in self.place_history:
+                self.place_history.append(val)
+                if len(self.place_history) > 5:
+                    self.place_history = self.place_history[-5:]
+                # Update persistent history
+                self.history["place_history"] = self.place_history
+            if self.place_dropdown:
+                self.place_dropdown.destroy()
+                self.place_dropdown = None
+
+        def select_place_history(val):
+            self.place_entry_var.set(val)
+            hide_place_dropdown()
+
+        # self.place_entry.bind("<FocusIn>", show_place_dropdown)  # Removed: don't show dropdown on focus
+        self.place_entry.bind("<FocusOut>", lambda e: self.after(150, hide_place_dropdown))
+        self.place_entry.bind("<Key>", hide_place_dropdown)
+        place_dd_btn = ctk.CTkButton(place_entry_row, text="▼", width=32, height=32, fg_color="#23232a", hover_color="#333348", font=ctk.CTkFont(size=14), command=show_place_dropdown)
+        place_dd_btn.pack(side="right", padx=(4, 0))
+
+        # (Removed duplicate assignment that overwrites loaded history)
+
+        def show_place_dropdown(event=None):
+            if self.place_dropdown:
+                self.place_dropdown.destroy()
+            if not self.place_history:
+                return
+            self.place_dropdown = ctk.CTkFrame(input_frame, fg_color="#23232a", corner_radius=8)
+            self.place_dropdown.place(in_=self.place_entry, relx=0, rely=1, relwidth=1)
+            for val in reversed(self.place_history):
+                btn = ctk.CTkButton(self.place_dropdown, text=val, width=1, height=28, fg_color="#23232a", hover_color="#333348", anchor="w",
+                                    font=ctk.CTkFont(size=13), command=lambda v=val: select_place_history(v))
+                btn.pack(fill="x")
+
+        def hide_place_dropdown(event=None):
+            if self.place_dropdown:
+                self.place_dropdown.destroy()
+                self.place_dropdown = None
+
+        def select_place_history(val):
+            self.place_entry_var.set(val)
+            hide_place_dropdown()
+
+        self.place_entry.bind("<FocusIn>", show_place_dropdown)
+        self.place_entry.bind("<FocusOut>", lambda e: self.after(150, hide_place_dropdown))
+        self.place_entry.bind("<Key>", hide_place_dropdown)
+
+        # --- Custom Dropdown for Job ID ---
         ctk.CTkLabel(input_frame, text="Job ID (Optional)").pack(anchor="w")
-        self.job_entry = ctk.CTkEntry(input_frame)
-        self.job_entry.pack(fill="x", pady=5)
-        self.job_entry.insert(0, config.get("last_job_id", ""))
+        self.job_entry_var = ctk.StringVar(value=config.get("last_job_id", ""))
+        job_entry_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        job_entry_row.pack(fill="x", pady=5)
+        self.job_entry = ctk.CTkEntry(job_entry_row, textvariable=self.job_entry_var)
+        self.job_entry.pack(side="left", fill="x", expand=True)
+
+        # Job ID dropdown logic (functions must be defined before button)
+        self.job_history = list(self.history.get("job_history", []))[-5:]
+        self.job_dropdown = None
+
+        def show_job_dropdown(event=None):
+            if self.job_dropdown:
+                self.job_dropdown.destroy()
+            if not self.job_history:
+                return
+            self.job_dropdown = ctk.CTkFrame(input_frame, fg_color="#23232a", corner_radius=8)
+            self.job_dropdown.place(in_=self.job_entry, relx=0, rely=1, relwidth=1)
+            for val in reversed(self.job_history):
+                btn = ctk.CTkButton(self.job_dropdown, text=val, width=1, height=28, fg_color="#23232a", hover_color="#333348", anchor="w",
+                                    font=ctk.CTkFont(size=13), command=lambda v=val: select_job_history(v))
+                btn.pack(fill="x")
+
+        def hide_job_dropdown(event=None):
+            # Store current input in history if not empty and not duplicate
+            val = self.job_entry_var.get().strip()
+            if val and val not in self.job_history:
+                self.job_history.append(val)
+                if len(self.job_history) > 5:
+                    self.job_history = self.job_history[-5:]
+                # Update persistent history
+                self.history["job_history"] = self.job_history
+            if self.job_dropdown:
+                self.job_dropdown.destroy()
+                self.job_dropdown = None
+
+        def select_job_history(val):
+            self.job_entry_var.set(val)
+            hide_job_dropdown()
+
+        self.job_entry.bind("<FocusIn>", show_job_dropdown)
+        self.job_entry.bind("<FocusOut>", lambda e: self.after(150, hide_job_dropdown))
+        self.job_entry.bind("<Key>", hide_job_dropdown)
+        job_dd_btn = ctk.CTkButton(job_entry_row, text="▼", width=32, height=32, fg_color="#23232a", hover_color="#333348", font=ctk.CTkFont(size=14), command=show_job_dropdown)
+        job_dd_btn.pack(side="right", padx=(4, 0))
+
+        self.job_history = config.get("job_history", [])[-5:]
+        self.job_dropdown = None
+
+        def show_job_dropdown(event=None):
+            if self.job_dropdown:
+                self.job_dropdown.destroy()
+            if not self.job_history:
+                return
+            self.job_dropdown = ctk.CTkFrame(input_frame, fg_color="#23232a", corner_radius=8)
+            self.job_dropdown.place(in_=self.job_entry, relx=0, rely=1, relwidth=1)
+            for val in reversed(self.job_history):
+                btn = ctk.CTkButton(self.job_dropdown, text=val, width=1, height=28, fg_color="#23232a", hover_color="#333348", anchor="w",
+                                    font=ctk.CTkFont(size=13), command=lambda v=val: select_job_history(v))
+                btn.pack(fill="x")
+
+        def hide_job_dropdown(event=None):
+            if self.job_dropdown:
+                self.job_dropdown.destroy()
+                self.job_dropdown = None
+
+        def select_job_history(val):
+            self.job_entry_var.set(val)
+            hide_job_dropdown()
+
+        self.job_entry.bind("<FocusIn>", show_job_dropdown)
+        self.job_entry.bind("<FocusOut>", lambda e: self.after(150, hide_job_dropdown))
+        self.job_entry.bind("<Key>", hide_job_dropdown)
 
         # Buttons
         btn_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
@@ -652,32 +840,20 @@ class ModernRobloxManager(ctk.CTk):
 
     def import_cookie(self):
         dialog = ctk.CTkToplevel(self)
-        dialog.geometry("400x260")
-        dialog.configure(fg_color="#18181b")
-        dialog.wm_overrideredirect(True)
-        dialog.resizable(False, False)
+        dialog.title("Import Cookie")
+        dialog.geometry("400x200")
+        dialog.configure(fg_color="#0a0a0a")
+        dialog.wm_overrideredirect(True)  # Remove titlebar to prevent moving
 
         # Center to main GUI
         x = self.winfo_rootx() + (self.winfo_width() // 2) - (400 // 2)
-        y = self.winfo_rooty() + (self.winfo_height() // 2) - (260 // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (200 // 2)
         dialog.geometry(f"+{x}+{y}")
 
-        frame = ctk.CTkFrame(dialog, fg_color="#23232a", corner_radius=16, border_width=0)
-        frame.pack(expand=True, fill="both", padx=18, pady=18)
+        ctk.CTkLabel(dialog, text="Paste .ROBLOSECURITY cookie:").pack(pady=10)
 
-        # Logo at the top
-        try:
-            logo_img = ctk.CTkImage(light_image=Image.open("assets/logo.png"), dark_image=Image.open("assets/logo.png"), size=(64, 64))
-            logo_label = ctk.CTkLabel(frame, image=logo_img, text="", bg_color="transparent")
-            logo_label.pack(pady=(0, 6))
-        except Exception as e:
-            logo_label = None
-
-        ctk.CTkLabel(frame, text="Import Roblox Cookie", font=ctk.CTkFont(size=18, weight="bold"), text_color="#e5e5e5").pack(pady=(0, 2))
-        ctk.CTkLabel(frame, text="Paste your .ROBLOSECURITY cookie below", font=ctk.CTkFont(size=13), text_color="#b3b3b3").pack(pady=(0, 10))
-
-        entry = ctk.CTkEntry(frame, show="*", fg_color="#18181b", border_color="#444", border_width=2, text_color="#e5e5e5", corner_radius=8)
-        entry.pack(pady=(0, 16), padx=10, fill="x")
+        entry = ctk.CTkEntry(dialog, show="*")
+        entry.pack(pady=10, padx=20, fill="x")
 
         def do_import():
             cookie = entry.get().strip()
@@ -690,19 +866,16 @@ class ModernRobloxManager(ctk.CTk):
                     messagebox.showerror("Error", "Invalid cookie")
             dialog.destroy()
 
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(pady=(0, 2))
-        import_btn = ctk.CTkButton(btn_frame, text="Import", command=do_import, fg_color="#4f46e5", hover_color="#3730a3", text_color="#fff", corner_radius=8, width=100)
-        import_btn.pack(side="left", padx=(0, 8))
-        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, fg_color="#23232a", hover_color="#18181b", text_color="#b3b3b3", corner_radius=8, width=100)
-        cancel_btn.pack(side="left")
+        import_btn = ctk.CTkButton(dialog, text="Import", command=do_import)
+        import_btn.pack(pady=10)
 
-        # Focus and modal
-        entry.focus_set()
-        dialog.grab_set()
+        cancel_btn = ctk.CTkButton(dialog, text="Cancel", command=dialog.destroy)
+        cancel_btn.pack()
 
     def enable_multi_roblox(self):
         """Enable Multi Roblox + 773 fix"""
+        # hello programmers! I know you're reading this code, because you want to know how did I implement this feature in Python. (and most importantly, the 773 fix)
+        # because of that, I'll leave some comments here to help you understand.
         import subprocess
         import win32event
         import win32api
@@ -1488,6 +1661,11 @@ end
             time.sleep(1)  # Reduced delay
 
     def kill_all(self):
+        if not messagebox.askyesno(
+            "Confirm Kill All",
+            "Are you sure you want to terminate ALL Roblox instances? This will close every running Roblox window."
+        ):
+            return
         with state_lock:
             for pid in list(tracked_accounts.values()):
                 try:
@@ -1504,11 +1682,8 @@ end
         if not self.selected_accounts:
             messagebox.showerror("Error", "No accounts selected")
             return
-        def browser_queue():
-            for username in list(self.selected_accounts):
-                self.manager.launch_home(username)
-                time.sleep(1)  # 1 second delay between launches
-        threading.Thread(target=browser_queue, daemon=True).start()
+        for username in self.selected_accounts:
+            self.manager.launch_home(username)
 
     def toggle_ocr(self):
         enabled = self.ocr_var.get()
@@ -1547,18 +1722,19 @@ end
         # Normalize HTML escapes first
         job_norm = html.unescape(job_input).strip()  # ✅ fix &amp;
 
-        if job_norm.startswith('https://www.roblox.com/share?'):
-            parsed_url = urlparse(job_norm)
-            query_params = parse_qs(parsed_url.query)
-            code = query_params.get('code', [None])[0]
-            type_param = query_params.get('type', [None])[0]
-            if code and (type_param == 'Server'):
-                return place_id, code
-            messagebox.showerror("Invalid Input", "The provided URL is not a valid Roblox server share link.")
-            return None, None
-        else:
-            # Treat any non-URL input as a raw share code
+        import re
+        valid_games_url = re.compile(r"^https://www\.roblox\.com/games/\d+/.+\?privateServerLinkCode=\d+$")
+
+        if job_norm.isdigit():
             return place_id, job_norm
+        elif valid_games_url.match(job_norm):
+            return place_id, job_norm
+        else:
+            messagebox.showerror(
+                "Invalid Job ID",
+                "Job ID must be a numeric code or a Roblox private server link in the format:\nhttps://www.roblox.com/games/<placeId>/<name>?privateServerLinkCode=<code>"
+            )
+            return None, None
 
 
     def check_account_statuses(self):
@@ -1674,24 +1850,26 @@ end
 
     def open_settings(self):
         if self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.destroy()
-            self.settings_window = None
+            self.settings_window.lift()
+            self.settings_window.focus_force()
             return
 
         settings_win = ctk.CTkToplevel(self)
         self.settings_window = settings_win
-        settings_win.geometry("480x500")
-        settings_win.configure(fg_color="#111114")
-        settings_win.wm_overrideredirect(True)
+
+        settings_win.title("Settings")
+        settings_win.geometry("480x460")
         settings_win.resizable(False, False)
+        settings_win.configure(fg_color="#0a0a0a")
         settings_win.attributes("-alpha", 0.98)
         settings_win.attributes("-topmost", False)
         settings_win.transient(self)
 
-        # Center to main GUI
+        force_icon(settings_win)
+
         settings_win.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() // 2) - (480 // 2)
-        y = self.winfo_rooty() + (self.winfo_height() // 2) - (500 // 2)
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (settings_win.winfo_width() // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (settings_win.winfo_height() // 2)
         settings_win.geometry(f"+{x}+{y}")
 
         def on_close():
@@ -1701,58 +1879,48 @@ end
         settings_win.protocol("WM_DELETE_WINDOW", on_close)
         settings_win.bind("<Escape>", lambda e: on_close())
 
-        # Custom title bar
-        title_bar = ctk.CTkFrame(settings_win, fg_color="#000000", height=48, corner_radius=0)
-        title_bar.pack(fill="x", side="top")
-        try:
-            logo_img = ctk.CTkImage(light_image=Image.open("assets/logo.png"), dark_image=Image.open("assets/logo.png"), size=(32, 32))
-            logo_label = ctk.CTkLabel(title_bar, image=logo_img, text="", bg_color="transparent")
-            logo_label.pack(side="left", padx=(16, 8), pady=8)
-        except Exception:
-            pass
-        ctk.CTkLabel(title_bar, text="Discord Settings", font=ctk.CTkFont(size=20, weight="bold"), text_color="#e5e5e5").pack(side="left", pady=8)
-        close_btn = ctk.CTkButton(title_bar, text="✕", width=36, height=36, corner_radius=18, fg_color="#23232a", hover_color="#3d1122", text_color="#e5e5e5", command=on_close)
-        close_btn.pack(side="right", padx=12, pady=6)
-
-        # Main content frame
-        frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=16)
-        frame.pack(expand=True, fill="both", padx=18, pady=(0, 18))
+        ctk.CTkLabel(settings_win, text="Settings", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(28, 20))
 
         # === Discord Bot Token ===
-        token_frame = ctk.CTkFrame(frame, fg_color="#111114", corner_radius=14)
-        token_frame.pack(padx=40, pady=(24, 12), fill="x")
-        ctk.CTkLabel(token_frame, text="Discord Bot Token", font=ctk.CTkFont(size=13, weight="bold"), text_color="#cccccc").pack(anchor="w", padx=24, pady=(16, 8))
+        token_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
+        token_frame.pack(padx=40, pady=(0, 12), fill="x")
+
+        ctk.CTkLabel(token_frame, text="Discord Bot Token", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
         self.token_entry = ctk.CTkEntry(token_frame, placeholder_text="Paste token here...", show="•", height=40, corner_radius=10)
         self.token_entry.insert(0, BOT_TOKEN or "")
         self.token_entry.pack(padx=24, pady=(0, 16), fill="x")
 
         # === Report Channel ID ===
-        channel_frame = ctk.CTkFrame(frame, fg_color="#111114", corner_radius=14)
+        channel_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
         channel_frame.pack(padx=40, pady=(0, 20), fill="x")
-        ctk.CTkLabel(channel_frame, text="Report Channel ID", font=ctk.CTkFont(size=13, weight="bold"), text_color="#cccccc").pack(anchor="w", padx=24, pady=(16, 8))
+
+        ctk.CTkLabel(channel_frame, text="Report Channel ID", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
         self.channel_entry = ctk.CTkEntry(channel_frame, placeholder_text="Right-click channel → Copy Channel ID", height=40, corner_radius=10)
         self.channel_entry.insert(0, str(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else "")
         self.channel_entry.pack(padx=24, pady=(0, 16), fill="x")
 
         # Status label
-        self.settings_status = ctk.CTkLabel(frame, text="", font=ctk.CTkFont(size=13), height=32)
+        self.settings_status = ctk.CTkLabel(settings_win, text="", font=ctk.CTkFont(size=13), height=32)
         self.settings_status.pack(pady=10)
 
         # Buttons frame
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame = ctk.CTkFrame(settings_win, fg_color="transparent")
         btn_frame.pack(pady=16)
+
         ctk.CTkButton(
             btn_frame, text="Save Settings", width=150, height=44,
             font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b2b2b", hover_color="#3d3d3d",
             command=self.save_settings
         ).grid(row=0, column=0, padx=14)
+
         ctk.CTkButton(
             btn_frame, text="Connect Bot", width=150, height=44,
             font=ctk.CTkFont(size=14, weight="bold"), fg_color="#1a6333", hover_color="#2d8a4d",
             text_color="#ffffff", command=self.connect_bot
         ).grid(row=0, column=1, padx=14)
+
         ctk.CTkButton(
-            frame, text="Close", width=320, height=44,
+            settings_win, text="Close", width=320, height=44,
             font=ctk.CTkFont(size=14, weight="bold"), fg_color="#333338", hover_color="#44444a",
             command=on_close
         ).pack(pady=(10, 28))
@@ -1851,23 +2019,24 @@ Type these in a channel the bot can see (starts with !):
 • !toggleocr: Turns error scan on/off.
         """.strip()
         if self.help_window and self.help_window.winfo_exists():
-            self.help_window.destroy()
-            self.help_window = None
+            self.help_window.lift()
+            self.help_window.focus_force()
             return
 
         dialog = ctk.CTkToplevel(self)
         self.help_window = dialog
-        dialog.geometry("760x700")
-        dialog.configure(fg_color="#111114")
-        dialog.wm_overrideredirect(True)
+        dialog.title("How to Use – Robloxium")
+        dialog.geometry("760x680")
         dialog.resizable(False, False)
+        dialog.configure(fg_color="#0f0f0f")
         dialog.attributes("-topmost", False)
         dialog.transient(self)
 
-        # Center to main GUI
+        force_icon(dialog)
+
         dialog.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() // 2) - (760 // 2)
-        y = self.winfo_rooty() + (self.winfo_height() // 2) - (700 // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (680 // 2)
         dialog.geometry(f"+{x}+{y}")
 
         def on_close():
@@ -1877,32 +2046,26 @@ Type these in a channel the bot can see (starts with !):
         dialog.protocol("WM_DELETE_WINDOW", on_close)
         dialog.bind("<Escape>", lambda e: on_close())
 
-        # Custom title bar
-        title_bar = ctk.CTkFrame(dialog, fg_color="#000000", height=48, corner_radius=0)
-        title_bar.pack(fill="x", side="top")
-        try:
-            logo_img = ctk.CTkImage(light_image=Image.open("assets/logo.png"), dark_image=Image.open("assets/logo.png"), size=(32, 32))
-            logo_label = ctk.CTkLabel(title_bar, image=logo_img, text="", bg_color="transparent")
-            logo_label.pack(side="left", padx=(16, 8), pady=8)
-        except Exception:
-            pass
-        ctk.CTkLabel(title_bar, text="How to Use – Robloxium", font=ctk.CTkFont(size=19, weight="bold"), text_color="#e5e5e5").pack(side="left", pady=8)
-        close_btn = ctk.CTkButton(title_bar, text="✕", width=36, height=36, corner_radius=18, fg_color="#23232a", hover_color="#3d1122", text_color="#e5e5e5", command=on_close)
-        close_btn.pack(side="right", padx=12, pady=6)
+        ctk.CTkLabel(
+            dialog,
+            text="How to Use – Robloxium",
+            font=ctk.CTkFont(size=19, weight="bold"),
+            text_color="#e0e0e0"
+        ).pack(pady=(24, 12))
 
-        # Main content frame
-        frame = ctk.CTkFrame(dialog, fg_color="#111114", corner_radius=16)
-        frame.pack(expand=True, fill="both", padx=18, pady=(0, 18))
+        text_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        text_frame.pack(padx=30, pady=(0, 20), fill="both", expand=True)
 
         text_box = ctk.CTkTextbox(
-            frame,
+            text_frame,
             font=ctk.CTkFont(family="Consolas", size=13),
             wrap="word",
             fg_color="#1a1a1a",
             text_color="#e0e0e0",
             corner_radius=12
         )
-        text_box.pack(fill="both", expand=True, padx=20, pady=20)
+        text_box.pack(fill="both", expand=True)
+
         text_box.insert("0.0", help_text)
         text_box.configure(state="disabled")
 
@@ -1920,7 +2083,27 @@ import urllib.parse
 
 
 class RobloxAPI:
-    """Handles all Roblox API interactions"""
+    @staticmethod
+    def get_game_name(place_id):
+        """Fetch game name from Roblox API"""
+        if not place_id or not place_id.isdigit():
+            return None
+        try:
+            place_url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
+            place_response = requests.get(place_url, timeout=5)
+            if place_response.status_code == 200:
+                place_data = place_response.json()
+                universe_id = place_data.get("universeId")
+                if universe_id:
+                    game_url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+                    game_response = requests.get(game_url, timeout=5)
+                    if game_response.status_code == 200:
+                        game_data = game_response.json()
+                        if game_data and game_data.get("data") and len(game_data["data"]) > 0:
+                            return game_data["data"][0].get("name", None)
+        except:
+            pass
+        return None
     
     @staticmethod
     def get_username_from_api(roblosecurity_cookie):
@@ -2070,12 +2253,9 @@ class RobloxAPI:
             f"isPlayTogetherGame=false"
         )
 
-        if access_code:
-            place_launcher_url += f"&accessCode={access_code}"
         if link_code:
             place_launcher_url += f"&linkCode={link_code}"
-        if share_code and share_type:
-            place_launcher_url += f"&share&code={share_code}&type={share_type}"
+        
         url = (
             f"roblox-player:1"
             f"+launchmode:play"
