@@ -52,8 +52,50 @@ import websockets
 from urllib.parse import urlparse, parse_qs
 import pyperclip
 
+import base64
+from cryptography.fernet import Fernet
+
+# --- Encryption helpers ---
+KEY_FILE = "key.key"
+def get_encryption_key():
+    try:
+        with open(KEY_FILE, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        return key
+
+def encrypt_token(token):
+    if not token:
+        return ""
+    key = get_encryption_key()
+    f = Fernet(key)
+    return f.encrypt(token.encode()).decode()
+
+def decrypt_token(token_enc):
+    if not token_enc:
+        return ""
+    key = get_encryption_key()
+    f = Fernet(key)
+    try:
+        return f.decrypt(token_enc.encode()).decode()
+    except Exception:
+        return ""
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# === PATHS FOR ONEFILE COMPATIBILITY ===
+if getattr(sys, 'frozen', False):
+    # Running as a PyInstaller bundle
+    BASE_PATH = sys._MEIPASS
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+ASSETS_PATH = os.path.join(BASE_PATH, "assets")
+TESSERACT_PATH = os.path.join(BASE_PATH, "tesseract")
 
 # === CONFIGURATION ===
 ERROR_SCAN_ENABLED = False
@@ -109,23 +151,30 @@ _bot_running = False
 state_lock = threading.Lock()
 launch_lock = threading.Lock()
 
-if getattr(sys, 'frozen', False):
-    # Running as compiled .exe
-    base_path = os.path.dirname(sys.executable)
-    tesseract_path = os.path.join(base_path, "tesseract", "tesseract.exe")
-    if os.path.exists(tesseract_path):
-        pytesseract.pytesseract.tesseract_cmd = tesseract_path
-        os.environ["TESSDATA_PREFIX"] = os.path.join(base_path, "tesseract", "tessdata")
+
+# Set up tesseract path for OCR
+tesseract_exe = os.path.join(TESSERACT_PATH, "tesseract.exe")
+if os.path.exists(tesseract_exe):
+    pytesseract.pytesseract.tesseract_cmd = tesseract_exe
+    os.environ["TESSDATA_PREFIX"] = os.path.join(TESSERACT_PATH, "tessdata")
 
 def force_icon(window):
     """Forces the window icon to stay – fixes CTkToplevel icon disappearing bug"""
     try:
-        window.iconbitmap("assets/logo.ico")
-        # Force Tk to update the icon immediately and prevent overwriting
+        import tempfile, shutil
+        icon_path = os.path.join(ASSETS_PATH, "logo.ico")
+        # In onefile mode, copy to a temp file so Tkinter can access it
+        if getattr(sys, 'frozen', False):
+            tmp_icon = tempfile.NamedTemporaryFile(delete=False, suffix='.ico')
+            shutil.copyfile(icon_path, tmp_icon.name)
+            icon_path_to_use = tmp_icon.name
+        else:
+            icon_path_to_use = icon_path
+        window.iconbitmap(icon_path_to_use)
         window.update_idletasks()
-        window.after(50, lambda: window.iconbitmap("assets/logo.ico"))
-        window.after(100, lambda: window.iconbitmap("assets/logo.ico"))
-        window.after(300, lambda: window.iconbitmap("assets/logo.ico"))
+        window.after(50, lambda: window.iconbitmap(icon_path_to_use))
+        window.after(100, lambda: window.iconbitmap(icon_path_to_use))
+        window.after(300, lambda: window.iconbitmap(icon_path_to_use))
     except Exception as e:
         logging.warning(f"Could not force icon: {e}")
 
@@ -349,15 +398,16 @@ class DiscordBot:
 class ModernRobloxManager(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Robloxium")
+        self.title("Robloxium v1.0.0")
         self.geometry("1100x680")
         self.minsize(980, 600)
         self.configure(fg_color="#0a0a0a")
 
         # Load images
         self.iconbitmap("assets/logo.ico")
-        banner_pil = Image.open("assets/banner.png")
-        self.banner_image = ctk.CTkImage(light_image=banner_pil, dark_image=banner_pil, size=(banner_pil.width // 7, banner_pil.height // 7))  # Scale if necessary; adjust as needed
+        banner_pil = Image.open("assets/banners.png")
+        # Use a fixed larger size for the banner for more visible increase
+        self.banner_image = ctk.CTkImage(light_image=banner_pil, dark_image=banner_pil, size=(300, 40))
 
         self.manager = RobloxAccountManager(password="default")  # Use a secure password in production
         self.settings_window = None
@@ -503,18 +553,22 @@ class ModernRobloxManager(ctk.CTk):
         right_frame.pack(side="right", padx=18, pady=20)
 
         # Settings & Help buttons
+        # Load icons for settings and help
+        self.settings_icon = ctk.CTkImage(Image.open(os.path.join(ASSETS_PATH, "settings.png")), size=(28, 28))
+        self.help_icon = ctk.CTkImage(Image.open(os.path.join(ASSETS_PATH, "help.png")), size=(32, 32))
+
         settings_btn = ctk.CTkButton(
-            right_frame, text="⚙", width=36, height=36, corner_radius=20,
-            fg_color="#111114", hover_color="#111114", font=ctk.CTkFont(size=20),
-            command=self.open_settings
+            right_frame, text="", width=36, height=36, corner_radius=20,
+            fg_color="#111114", hover_color="#111114",
+            image=self.settings_icon, command=self.open_settings
         )
         settings_btn.pack(side="right")
         ToolTip(settings_btn, "Open Settings (Discord Bot Token, etc.)")
 
         help_btn = ctk.CTkButton(
-            right_frame, text="❓", width=36, height=36, corner_radius=18,
-            fg_color="#111114", hover_color="#111114", font=ctk.CTkFont(size=18),
-            command=self.show_help
+            right_frame, text="", width=40, height=40, corner_radius=20,
+            fg_color="#111114", hover_color="#111114",
+            image=self.help_icon, command=self.show_help
         )
         help_btn.pack(side="right", padx=(0, 10))
         ToolTip(help_btn, "Click to view How to Use guide")
@@ -841,19 +895,32 @@ class ModernRobloxManager(ctk.CTk):
 
     def import_cookie(self):
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Import Cookie")
         dialog.geometry("400x200")
-        dialog.configure(fg_color="#0a0a0a")
-        dialog.wm_overrideredirect(True)  # Remove titlebar to prevent moving
+        dialog.configure(fg_color="#0a0a0a")  # Window frame color unified
+        dialog.wm_overrideredirect(True)
 
         # Center to main GUI
         x = self.winfo_rootx() + (self.winfo_width() // 2) - (400 // 2)
         y = self.winfo_rooty() + (self.winfo_height() // 2) - (200 // 2)
         dialog.geometry(f"+{x}+{y}")
 
-        ctk.CTkLabel(dialog, text="Paste .ROBLOSECURITY cookie:").pack(pady=10)
+        def on_close():
+            dialog.destroy()
 
-        entry = ctk.CTkEntry(dialog, show="*")
+        # X button (absolute top-right, flat color)
+        x_btn = ctk.CTkButton(
+            dialog, text="✕", width=36, height=36,
+            fg_color="#0a0a0a", hover_color="#0a0a0a", text_color="#e0e0e0",
+            font=ctk.CTkFont(size=18, weight="bold"), corner_radius=8,
+            command=on_close
+        )
+        x_btn.place(relx=1.0, rely=0.0, x=0, y=0, anchor="ne")
+        x_btn.lift()
+
+        ctk.CTkLabel(dialog, text="Paste .ROBLOSECURITY cookie:", text_color="#e0e0e0", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=28)
+
+
+        entry = ctk.CTkEntry(dialog, show="*", fg_color="#19191e", text_color="#ffffff")
         entry.pack(pady=10, padx=20, fill="x")
 
         def do_import():
@@ -867,11 +934,11 @@ class ModernRobloxManager(ctk.CTk):
                     messagebox.showerror("Error", "Invalid cookie")
             dialog.destroy()
 
-        import_btn = ctk.CTkButton(dialog, text="Import", command=do_import)
-        import_btn.pack(pady=10)
+        # Import button directly below the entry field
+        import_btn = ctk.CTkButton(dialog, text="Import", command=do_import, fg_color="#1a6333", hover_color="#2d8a4d", width=120, height=36, font=ctk.CTkFont(size=14, weight="bold"))
+        import_btn.pack(pady=(4, 0))
 
-        cancel_btn = ctk.CTkButton(dialog, text="Cancel", command=dialog.destroy)
-        cancel_btn.pack()
+        # (removed duplicate do_import and placeholder)
 
     def enable_multi_roblox(self):
         """Enable Multi Roblox + 773 fix"""
@@ -1484,118 +1551,6 @@ end
 
         self.update_selection()
 
-    def open_script_editor(self, username):
-        if username not in self.connected_clients:
-            messagebox.showerror("Error", "Account not connected via Nexus. Inject Nexus.lua first.")
-            return
-
-        editor_win = ctk.CTkToplevel(self)
-        editor_win.title(f"Script Editor - {username}")
-        editor_win.geometry("700x500")
-        editor_win.minsize(600, 400)
-        editor_win.configure(fg_color="#0a0a0a")
-
-        force_icon(editor_win)
-
-        # Main frame with padding
-        main_frame = ctk.CTkFrame(editor_win, fg_color="#111114", corner_radius=14)
-        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
-
-        # Title label
-        title_label = ctk.CTkLabel(main_frame, text="Lua Script Editor", font=ctk.CTkFont(size=18, weight="bold"))
-        title_label.pack(pady=(10, 5))
-
-        # Instruction label
-        instr_label = ctk.CTkLabel(main_frame, text="Enter Lua code to execute on this Roblox instance", 
-                                   font=ctk.CTkFont(size=13), text_color="#aaaaaa")
-        instr_label.pack(pady=(0, 10))
-
-        # Editor frame
-        editor_frame = ctk.CTkFrame(main_frame, fg_color="#1a1a1a", corner_radius=10)
-        editor_frame.pack(fill="both", expand=True, pady=5)
-
-        # Line numbers
-        line_frame = ctk.CTkFrame(editor_frame, width=50, fg_color="#2b2b2b", corner_radius=0)
-        line_frame.pack(side="left", fill="y")
-        line_numbers = tk.Text(line_frame, width=4, padx=8, pady=8, takefocus=0, bd=0, bg="#2b2b2b", fg="#ffffff", 
-                               state='disabled', wrap='none', font=("Consolas", 13))
-        line_numbers.pack(fill="y")
-
-        # Text box
-        text_box = ctk.CTkTextbox(editor_frame, font=ctk.CTkFont(family="Consolas", size=13), wrap='none', 
-                                  fg_color="#1a1a1a", text_color="#ffffff", corner_radius=0, border_width=0)
-        text_box.pack(side="left", fill="both", expand=True, padx=(0, 0), pady=0)
-
-        # Syntax highlighting setup
-        repl_dict = {
-            "keyword": (re.compile(r'\b(and|break|do|else|elseif|end|false|for|function|goto|if|in|local|nil|not|or|repeat|return|then|true|until|while)\b'), "#F92672"),
-            "string": (re.compile(r'".*?"|\'.*?\'|\[=.*?\=]'), "#E6DB74"),
-            "comment": (re.compile(r'--.*'), "#75715E"),
-            "number": (re.compile(r'\b\d+\.?\d*\b'), "#AE81FF"),
-        }
-
-        for tag, (pattern, color) in repl_dict.items():
-            text_box._textbox.tag_config(tag, foreground=color)
-
-        def highlight_syntax(event=None):
-            text = text_box.get("1.0", "end")
-            for tag in repl_dict:
-                text_box._textbox.tag_remove(tag, "1.0", "end")
-                for match in repl_dict[tag][0].finditer(text):
-                    start = f"1.0 + {match.start()} chars"
-                    end = f"1.0 + {match.end()} chars"
-                    text_box._textbox.tag_add(tag, start, end)
-
-        def update_line_numbers(event=None):
-            line_numbers.config(state='normal')
-            line_numbers.delete('1.0', 'end')
-            lines = int(text_box.index('end-1c').split('.')[0])
-            for i in range(1, lines + 1):
-                line_numbers.insert('end', f"{i}\n")
-            line_numbers.config(state='disabled')
-
-        def sync_scroll(first, last):
-            line_numbers.yview("moveto", first)
-
-        text_box.configure(yscrollcommand=sync_scroll)
-        # Note: Removed line_numbers.yscrollcommand to prevent loop and invalid calls
-
-        text_box.bind("<KeyRelease>", lambda e: (highlight_syntax(), update_line_numbers()))
-
-        # Initial update
-        highlight_syntax()
-        update_line_numbers()
-
-        # Buttons frame
-        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        btn_frame.pack(pady=10, fill="x", padx=20)
-
-        execute_btn = ctk.CTkButton(btn_frame, text="Execute", command=lambda: self.execute_script(username, text_box.get("1.0", "end")),
-                                    fg_color="#1a6333", hover_color="#2d8a4d", width=140, height=40,
-                                    font=ctk.CTkFont(size=14, weight="bold"))
-        execute_btn.pack(side="right", padx=(10, 0))
-
-        def save_to_file():
-            code = text_box.get("1.0", "end").strip()
-            if not code:
-                messagebox.showwarning("Empty", "No code to save.")
-                return
-            file_path = f"scripts/{username}.lua"
-            os.makedirs("scripts", exist_ok=True)
-            with open(file_path, "w") as f:
-                f.write(code)
-            messagebox.showinfo("Saved", f"Script saved to {file_path}")
-
-        save_btn = ctk.CTkButton(btn_frame, text="Save to File", command=save_to_file,
-                                 fg_color="#2b2b2b", hover_color="#3d3d3d", width=140, height=40,
-                                 font=ctk.CTkFont(size=14, weight="bold"))
-        save_btn.pack(side="right", padx=(10, 0))
-
-        close_btn = ctk.CTkButton(btn_frame, text="Close", command=editor_win.destroy,
-                                  fg_color="#3d1122", hover_color="#6b1a44", width=140, height=40,
-                                  font=ctk.CTkFont(size=14, weight="bold"))
-        close_btn.pack(side="right")
-
     def execute_script(self, username, code):
         ws = self.connected_clients.get(username)
         if ws:
@@ -1620,7 +1575,7 @@ end
         if self.manager.add_account(amount=1):  # Limited to 1 for simplicity, can change
             self.after(0, self.populate_accounts)
         else:
-            self.after(0, lambda: messagebox.showerror("Error", "Failed to add account(s). Check console for details."))
+            pass
 
     def remove_accounts(self):
         if not self.selected_accounts:
@@ -1858,13 +1813,13 @@ end
         settings_win = ctk.CTkToplevel(self)
         self.settings_window = settings_win
 
-        settings_win.title("Settings")
         settings_win.geometry("480x460")
         settings_win.resizable(False, False)
-        settings_win.configure(fg_color="#0a0a0a")
+        settings_win.configure(fg_color="#0a0a0a")  # Window frame color unified
         settings_win.attributes("-alpha", 0.98)
         settings_win.attributes("-topmost", False)
         settings_win.transient(self)
+        settings_win.wm_overrideredirect(True)  # Remove title bar
 
         force_icon(settings_win)
 
@@ -1877,58 +1832,142 @@ end
             self.settings_window = None
             settings_win.destroy()
 
-        settings_win.protocol("WM_DELETE_WINDOW", on_close)
         settings_win.bind("<Escape>", lambda e: on_close())
 
-        ctk.CTkLabel(settings_win, text="Settings", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(28, 20))
 
-        # === Discord Bot Token ===
-        token_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
-        token_frame.pack(padx=40, pady=(0, 12), fill="x")
 
-        ctk.CTkLabel(token_frame, text="Discord Bot Token", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
-        self.token_entry = ctk.CTkEntry(token_frame, placeholder_text="Paste token here...", show="•", height=40, corner_radius=10)
-        self.token_entry.insert(0, BOT_TOKEN or "")
+        # Tabbed side panel layout
+        main_frame = ctk.CTkFrame(settings_win, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=0, pady=(0, 0))
+
+        # X button (absolute top-right, flat color)
+        x_btn = ctk.CTkButton(
+            settings_win, text="✕", width=36, height=36,
+            fg_color="#0a0a0a", hover_color="#0a0a0a", text_color="#e0e0e0",
+            font=ctk.CTkFont(size=18, weight="bold"), corner_radius=8,
+            command=on_close
+        )
+        x_btn.place(relx=1.0, rely=0.0, x=0, y=0, anchor="ne")
+        x_btn.lift()
+
+        # Side panel for tabs
+        side_panel = ctk.CTkFrame(main_frame, fg_color="#0a0a0a", width=120, corner_radius=16)
+        side_panel.pack(side="left", fill="y", padx=(18, 0), pady=18)
+        side_panel.pack_propagate(False)
+
+        tab_names = ["General", "Discord"]
+        self.settings_tab = tk.StringVar(value=tab_names[0])
+
+        def switch_tab(tab):
+            self.settings_tab.set(tab)
+            for f in [general_frame, discord_frame]:
+                f.pack_forget()
+            if tab == "General":
+                general_frame.pack(fill="both", expand=True)
+            elif tab == "Discord":
+                discord_frame.pack(fill="both", expand=True)
+
+        tab_buttons = []
+        for tab in tab_names:
+            btn = ctk.CTkButton(side_panel, text=tab, width=100, height=38, corner_radius=10,
+                                fg_color="#0a0a0a" if self.settings_tab.get() == tab else "#0a0a0a",
+                                hover_color="#0a0a0a",
+                                command=lambda t=tab: switch_tab(t),
+                                font=ctk.CTkFont(size=15, weight="bold"))
+            btn.pack(pady=(10 if tab==tab_names[0] else 8, 0), padx=10)
+            tab_buttons.append(btn)
+
+        def update_tab_colors():
+            for i, tab in enumerate(tab_names):
+                tab_buttons[i].configure(fg_color="#0a0a0a" if self.settings_tab.get() == tab else "#0a0a0a")
+
+        def switch_tab(tab):
+            self.settings_tab.set(tab)
+            for f in [general_frame, discord_frame]:
+                f.pack_forget()
+            if tab == "General":
+                general_frame.pack(fill="both", expand=True)
+            elif tab == "Discord":
+                discord_frame.pack(fill="both", expand=True)
+            update_tab_colors()
+
+        # Main content area
+        content_panel = ctk.CTkFrame(main_frame, fg_color="#0a0a0a", corner_radius=16)
+        content_panel.pack(side="left", fill="both", expand=True, padx=(0, 18), pady=18)
+
+        # General tab
+        general_frame = ctk.CTkFrame(content_panel, fg_color="#0a0a0a")
+        ctk.CTkLabel(general_frame, text="General Settings", font=ctk.CTkFont(size=16, weight="bold"), text_color="#e0e0e0").pack(anchor="w", padx=24, pady=(18, 8))
+        # Multi-instance (mutex) checkbox
+        self.multi_mutex_var = tk.BooleanVar(value=config.get("multi_mutex_enabled", False))
+        def on_mutex_toggle():
+            if self.multi_mutex_var.get():
+                self.enable_multi_roblox()
+            else:
+                self.disable_multi_roblox()
+            # Auto-save to config
+            config["multi_mutex_enabled"] = self.multi_mutex_var.get()
+            with open(CONFIG_FILE, "w", encoding='utf-8') as f:
+                json.dump(config, f, indent=4)
+        mutex_checkbox = ctk.CTkCheckBox(general_frame, text="Enable Multi-Instance (Multi Roblox)", variable=self.multi_mutex_var, command=on_mutex_toggle, font=ctk.CTkFont(size=14), fg_color="#23232a", border_color="#444", corner_radius=8)
+        mutex_checkbox.pack(anchor="w", padx=32, pady=(32, 12))
+
+        # Error Scan checkbox
+        self.ocr_var = ctk.BooleanVar(value=config.get("error_scan_enabled", False))
+        def on_ocr_toggle():
+            self.toggle_ocr()
+            # Auto-save to config
+            config["error_scan_enabled"] = self.ocr_var.get()
+            with open(CONFIG_FILE, "w", encoding='utf-8') as f:
+                json.dump(config, f, indent=4)
+        ocr_checkbox = ctk.CTkCheckBox(general_frame, text="Enable Error Scan", variable=self.ocr_var, command=on_ocr_toggle, font=ctk.CTkFont(size=14), fg_color="#23232a", border_color="#444", corner_radius=8)
+        ocr_checkbox.pack(anchor="w", padx=32, pady=(0, 12))
+
+        # Discord tab
+        discord_frame = ctk.CTkFrame(content_panel, fg_color="#0a0a0a")
+        ctk.CTkLabel(discord_frame, text="Discord Settings", font=ctk.CTkFont(size=16, weight="bold"), text_color="#e0e0e0").pack(anchor="w", padx=24, pady=(18, 8))
+        ctk.CTkLabel(discord_frame, text="Discord Bot Token", font=ctk.CTkFont(size=13, weight="bold"), text_color="#e0e0e0").pack(anchor="w", padx=24, pady=(8, 8))
+        self.token_entry = ctk.CTkEntry(discord_frame, placeholder_text="Paste token here...", show="•", height=40, corner_radius=10, fg_color="#19191e", text_color="#ffffff")
+        # Decrypt token for display
+        token_val = BOT_TOKEN or config.get("bot_token", "")
+        if token_val and token_val.startswith("gAAAA"):
+            token_val = decrypt_token(token_val)
+        self.token_entry.insert(0, token_val)
         self.token_entry.pack(padx=24, pady=(0, 16), fill="x")
 
-        # === Report Channel ID ===
-        channel_frame = ctk.CTkFrame(settings_win, fg_color="#111114", corner_radius=14)
-        channel_frame.pack(padx=40, pady=(0, 20), fill="x")
-
-        ctk.CTkLabel(channel_frame, text="Report Channel ID", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=24, pady=(16, 8))
-        self.channel_entry = ctk.CTkEntry(channel_frame, placeholder_text="Right-click channel → Copy Channel ID", height=40, corner_radius=10)
+        ctk.CTkLabel(discord_frame, text="Report Channel ID", font=ctk.CTkFont(size=13, weight="bold"), text_color="#e0e0e0").pack(anchor="w", padx=24, pady=(8, 8))
+        self.channel_entry = ctk.CTkEntry(discord_frame, placeholder_text="Right-click channel → Copy Channel ID", height=40, corner_radius=10, fg_color="#19191e", text_color="#ffffff")
         self.channel_entry.insert(0, str(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else "")
         self.channel_entry.pack(padx=24, pady=(0, 16), fill="x")
 
         # Status label
-        self.settings_status = ctk.CTkLabel(settings_win, text="", font=ctk.CTkFont(size=13), height=32)
+        self.settings_status = ctk.CTkLabel(discord_frame, text="", font=ctk.CTkFont(size=13), height=32, text_color="#e0e0e0")
         self.settings_status.pack(pady=10)
 
-        # Buttons frame
-        btn_frame = ctk.CTkFrame(settings_win, fg_color="transparent")
-        btn_frame.pack(pady=16)
-
-        ctk.CTkButton(
-            btn_frame, text="Save Settings", width=150, height=44,
+        # Buttons directly below the last input field
+        save_btn = ctk.CTkButton(
+            discord_frame, text="Save Settings", width=150, height=44,
             font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b2b2b", hover_color="#3d3d3d",
             command=self.save_settings
-        ).grid(row=0, column=0, padx=14)
+        )
+        save_btn.pack(pady=(0, 8))
 
-        ctk.CTkButton(
-            btn_frame, text="Connect Bot", width=150, height=44,
+        connect_btn = ctk.CTkButton(
+            discord_frame, text="Connect Bot", width=150, height=44,
             font=ctk.CTkFont(size=14, weight="bold"), fg_color="#1a6333", hover_color="#2d8a4d",
             text_color="#ffffff", command=self.connect_bot
-        ).grid(row=0, column=1, padx=14)
+        )
+        connect_btn.pack(pady=(0, 4))
 
-        ctk.CTkButton(
-            settings_win, text="Close", width=320, height=44,
-            font=ctk.CTkFont(size=14, weight="bold"), fg_color="#333338", hover_color="#44444a",
-            command=on_close
-        ).pack(pady=(10, 28))
+
+        # Show default tab and update tab colors (must be after switch_tab is defined)
+        switch_tab(self.settings_tab.get())
 
     def save_settings(self):
         global BOT_TOKEN, REPORT_CHANNEL_ID, ERROR_SCAN_ENABLED
-        BOT_TOKEN = self.token_entry.get().strip() or None
+        # Encrypt token before saving
+        raw_token = self.token_entry.get().strip()
+        BOT_TOKEN = raw_token or None
         try:
             REPORT_CHANNEL_ID = int(self.channel_entry.get().strip()) if self.channel_entry.get().strip() else None
         except ValueError:
@@ -1937,9 +1976,11 @@ end
 
         ERROR_SCAN_ENABLED = self.ocr_var.get()  # Save OCR toggle state too
 
-        config["bot_token"] = BOT_TOKEN
+        # Only encrypt if not empty
+        config["bot_token"] = encrypt_token(raw_token) if raw_token else ""
         config["channel_id"] = REPORT_CHANNEL_ID
         config["error_scan_enabled"] = ERROR_SCAN_ENABLED
+        config["multi_mutex_enabled"] = self.multi_mutex_var.get()
 
         try:
             with open(CONFIG_FILE, "w", encoding='utf-8') as f:
@@ -1957,7 +1998,11 @@ end
         if not DISCORD_AVAILABLE:
             messagebox.showerror("Error", "discord.py not installed")
             return
-        if not BOT_TOKEN:
+        # Always decrypt the token before use
+        token_val = BOT_TOKEN or config.get("bot_token", "")
+        if token_val and token_val.startswith("gAAAA"):
+            token_val = decrypt_token(token_val)
+        if not token_val:
             messagebox.showerror("Error", "Bot token required")
             return
         global _bot_running
@@ -1965,7 +2010,7 @@ end
             return
         _bot_running = True
         self.discord_bot = DiscordBot(self)
-        threading.Thread(target=self.discord_bot.bot.run, args=(BOT_TOKEN,), daemon=True).start()
+        threading.Thread(target=self.discord_bot.bot.run, args=(token_val,), daemon=True).start()
 
     def show_help(self):
         help_text = """
@@ -2026,12 +2071,12 @@ Type these in a channel the bot can see (starts with !):
 
         dialog = ctk.CTkToplevel(self)
         self.help_window = dialog
-        dialog.title("How to Use – Robloxium")
         dialog.geometry("760x680")
         dialog.resizable(False, False)
-        dialog.configure(fg_color="#0f0f0f")
+        dialog.configure(fg_color="#0a0a0a")  # Window frame color unified
         dialog.attributes("-topmost", False)
         dialog.transient(self)
+        dialog.wm_overrideredirect(True)  # Remove title bar
 
         force_icon(dialog)
 
@@ -2044,7 +2089,6 @@ Type these in a channel the bot can see (starts with !):
             self.help_window = None
             dialog.destroy()
 
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
         dialog.bind("<Escape>", lambda e: on_close())
 
         ctk.CTkLabel(
@@ -2054,7 +2098,17 @@ Type these in a channel the bot can see (starts with !):
             text_color="#e0e0e0"
         ).pack(pady=(24, 12))
 
-        text_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        # X button (absolute top-right, flat color)
+        x_btn = ctk.CTkButton(
+            dialog, text="✕", width=36, height=36,
+            fg_color="#0a0a0a", hover_color="#0a0a0a", text_color="#e0e0e0",
+            font=ctk.CTkFont(size=18, weight="bold"), corner_radius=8,
+            command=on_close
+        )
+        x_btn.place(relx=1.0, rely=0.0, x=0, y=0, anchor="ne")
+        x_btn.lift()
+
+        text_frame = ctk.CTkFrame(dialog, fg_color="#0a0a0a")
         text_frame.pack(padx=30, pady=(0, 20), fill="both", expand=True)
 
         text_box = ctk.CTkTextbox(
