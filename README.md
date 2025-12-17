@@ -42,9 +42,9 @@ python robloxium.py
 ---
 
 ## ⚙️ Usage
-- **Import Accounts**: Use the Import Cookie dialog to add accounts (no cancel button, X to close)
-- **Manage Accounts**: View, edit, and switch between accounts easily
-- **Discord Bot**: Add your bot token (encrypted for security) to enable Discord features
+- **Import Accounts**: Use the Import Cookie dialog to add accounts
+- **Manage Accounts**: Add, launch, and kill accounts easily
+- **Discord Bot**: Add your bot token to enable Discord features
 - **Automation**: Use built-in tools for browser automation and OCR tasks
 
 ---
