@@ -1,5 +1,3 @@
-# Robloxium
-
 ![Robloxium Banner](assets/banners.png)
 
 ## 🚀 Overview
