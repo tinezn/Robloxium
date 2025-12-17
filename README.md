@@ -55,15 +55,11 @@ python robloxium.py
 ```
 Robloxium/
 ├── robloxium.py           # Main application
-├── Robloxium Setup.iss    # Windows installer script
 ├── AccountManagerData/    # Encrypted account data (excluded from git)
 ├── assets/                # Images, icons, banners
 ├── tesseract/             # OCR binaries and configs
-├── build/                 # Build artifacts
-├── Output/                # Output files
 ├── LICENSE.txt            # GNU GPL v3
 ├── README.md              # This file
-└── ...
 ```
 
 ---
