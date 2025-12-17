@@ -1,6 +1,6 @@
 # Robloxium
 
-![Robloxium Banner](https://raw.githubusercontent.com/yourusername/robloxium/main/assets/banner.png)
+![Robloxium Banner](assets/banners.png)
 
 ## 🚀 Overview
 Robloxium is a powerful, open-source account and automation manager for Roblox, featuring a modern GUI, Discord integration, secure credential storage, and advanced automation tools. Built with Python 3.10+, it streamlines multi-account management, automates browser tasks, and provides robust error handling—all in a user-friendly package.
@@ -29,7 +29,7 @@ Robloxium is a powerful, open-source account and automation manager for Roblox, 
 - Git (for source installation)
 
 ### Quick Start (Installer)
-1. Download the latest release from [www.robloxium.xyz](https://www.robloxium.xyz) or [Releases](https://github.com/yourusername/robloxium/releases)
+1. Download the latest release from [www.robloxium.xyz](https://www.robloxium.xyz)
 2. Run `Robloxium Setup.exe` and follow the prompts
 3. Launch Robloxium from your Start Menu or desktop shortcut
 
@@ -89,7 +89,7 @@ Pull requests are welcome! For major changes, please open an issue first to disc
 ---
 
 ## 📫 Contact
-For support or questions, open an issue or contact the maintainer at [your.email@example.com](mailto:your.email@example.com).
+For support or questions, open an issue or contact the maintainer at [support@robloxium.xyz](mailto:support@robloxium.xyz).
 
 ---
 
