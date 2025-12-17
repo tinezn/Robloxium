@@ -1,3 +1,6 @@
 # Ignore sensitive and local-only files
 saved_accounts.json
 config.json
+
+# Ignore account data folder
+AccountManagerData/
