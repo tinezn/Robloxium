@@ -645,10 +645,12 @@ class ModernRobloxManager(ctk.CTk):
                 self.place_game_label.configure(text="Loading...")
                 def fetch_and_update():
                     name = RobloxAPI.get_game_name(place_id)
-                    if name:
-                        self.place_game_label.configure(text=f"{name}")
-                    else:
-                        self.place_game_label.configure(text="")
+                    def update_label():
+                        if name:
+                            self.place_game_label.configure(text=f"{name}")
+                        else:
+                            self.place_game_label.configure(text="")
+                    self.place_game_label.after(0, update_label)
                 threading.Thread(target=fetch_and_update, daemon=True).start()
             else:
                 self.place_game_label.configure(text="")
@@ -942,8 +944,6 @@ class ModernRobloxManager(ctk.CTk):
 
     def enable_multi_roblox(self):
         """Enable Multi Roblox + 773 fix"""
-        # hello programmers! I know you're reading this code, because you want to know how did I implement this feature in Python. (and most importantly, the 773 fix)
-        # because of that, I'll leave some comments here to help you understand.
         import subprocess
         import win32event
         import win32api
@@ -970,20 +970,13 @@ class ModernRobloxManager(ctk.CTk):
                     messagebox.showinfo("Success", "All Roblox instances have been closed.")
                 else:
                     return False
-            
-            # then here's the magic:
-            # to enable multi roblox, we create the mutex before roblox creates it.
-            # this means, when roblox starts, it cannot be created by roblox again.
-            # thus, allowing multiple instances to run. Simple, right? (doesn't fix 773 yet)
+
             mutex = win32event.CreateMutex(None, True, "ROBLOX_singletonEvent")
             print("[INFO] Multi Roblox activated.")
             
-            # check if mutex already existed (GetLastError returns ERROR_ALREADY_EXISTS = 183)
             if win32api.GetLastError() == 183:
                 print("[WARNING] Mutex already exists. Taking ownership...")
-            
-            # now let's get over on the 773 fix part
-            # first, we need to find the RobloxCookies.dat file
+
             cookies_path = os.path.join(
                 os.getenv('LOCALAPPDATA'),
                 r'Roblox\LocalStorage\RobloxCookies.dat'
@@ -992,16 +985,13 @@ class ModernRobloxManager(ctk.CTk):
             cookie_file = None
             if os.path.exists(cookies_path):
                 try:
-                    # to actually apply the 773 fix, we need to lock the cookies file
-                    # this prevents roblox from accessing it, which causes error 773 to not appear
-                    # and there, you have it, multi roblox + 773 fix!
                     cookie_file = open(cookies_path, 'r+b')
                     msvcrt.locking(cookie_file.fileno(), msvcrt.LK_NBLCK, os.path.getsize(cookies_path))
                     print("[INFO] Error 773 fix applied.")
-
                 except OSError:
                     print("[ERROR] Could not lock RobloxCookies.dat. It may already be locked.")
-
+                except Exception as e:
+                    print(f"[ERROR] Unexpected error opening/locking cookies file: {e}")
             else:
                 print("[ERROR] Cookies file not found. 773 fix skipped.")
 
