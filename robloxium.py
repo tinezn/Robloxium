@@ -6,7 +6,30 @@ import threading
 import subprocess
 import psutil
 import os
-from launcher_detect import detect_custom_launcher
+
+# --- Inlined from launcher_detect.py ---
+from typing import Optional
+
+def detect_custom_launcher() -> Optional[str]:
+    """
+    Detects the presence of Fishstrap or Bloxstrap launchers.
+    Returns the path to the preferred launcher executable, or None if not found.
+    Fishstrap is preferred if both are present.
+    """
+    # Common install locations for Bloxstrap and Fishstrap
+    possible_paths = [
+        # Fishstrap (preferred)
+        os.path.expandvars(r"%LOCALAPPDATA%\\Fishstrap\\Fishstrap.exe"),
+        os.path.expandvars(r"%ProgramFiles%\\Fishstrap\\Fishstrap.exe"),
+        # Bloxstrap
+        os.path.expandvars(r"%LOCALAPPDATA%\\Bloxstrap\\Bloxstrap.exe"),
+        os.path.expandvars(r"%ProgramFiles%\\Bloxstrap\\Bloxstrap.exe"),
+    ]
+    for path in possible_paths:
+        if os.path.isfile(path):
+            return path
+    return None
+
 import time
 import random
 import requests
@@ -444,6 +467,16 @@ class ModernRobloxManager(ctk.CTk):
         if BOT_TOKEN and DISCORD_AVAILABLE:
             self.connect_bot()
         self.after(100, self.process_gui_queue)
+        # Start PID check thread (always running)
+        if not hasattr(self, '_pid_thread') or not self._pid_thread.is_alive():
+            self._pid_thread = threading.Thread(target=self.pid_check_loop, daemon=True)
+            self._pid_thread.start()
+    def pid_check_loop(self):
+        while True:
+            with state_lock:
+                if tracked_accounts:
+                    self.check_account_statuses()
+            time.sleep(3)
 
     def process_gui_queue(self):
         try:
@@ -1635,7 +1668,10 @@ end
         enabled = self.ocr_var.get()
         self.ocr_label.configure(text=f" • OCR: {'ON' if enabled else 'OFF'}", text_color="#4caf50" if enabled else "#888")
         if enabled:
-            threading.Thread(target=self.scan_loop, daemon=True).start()
+            if not hasattr(self, '_scan_thread') or not self._scan_thread.is_alive():
+                self._scan_thread = threading.Thread(target=self.scan_loop, daemon=True)
+                self._scan_thread.start()
+        # No else needed: scan_loop checks self.ocr_var.get() and will exit if turned off
 
     def scan_loop(self):
         while self.ocr_var.get():
@@ -1643,10 +1679,9 @@ end
                 if not tracked_hwnds:
                     time.sleep(15)
                     continue
-            self.check_account_statuses()
             self.check_accounts_for_errors()
             self.gui_queue.put(lambda: self.populate_accounts())
-            time.sleep(15)  # Increased interval
+            time.sleep(15)
 
     def toggle_report(self):
         enabled = self.report_var.get()
